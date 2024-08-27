@@ -282,6 +282,7 @@ class SyringePump:
         if self.serial_port.is_open: self.serial_port.close()
 
 # Initializing pump & pressure sensor:
+global pump, pressure_sensor, load_cell
 pump = SyringePump('COM3') # Syringe pump has ~3.5 ms response time
 pressure_sensor = PressureSensor('COM7') # Pressure sensor has ~12 ms response time (can be a little faster but becomes a bit unstable)
 load_cell = LoadCell('Dev9/ai0', True, FUTEK_AMP_GAIN)
@@ -301,6 +302,9 @@ while LIVE_FORCE_READING_MODE:
     print(f"Force:\t {load_cell.get_force()} N")
     time.sleep(0.25)
 
+# globals for multithreading
+global volume_time, volume_data, pressure_time, pressure_data, force_time, force_data
+
 volume_time = []
 volume_data = []
 pressure_time = []
@@ -308,25 +312,92 @@ pressure_data = []
 force_time = []
 force_data = []
 
+
 pump.set_syringe_dims(SYRINGE_DIAMETER, SYRINGE_CAPACITY)
 pump.infuse_const_rate(TARGET_VOLUME, FLOW_RATE)
+global start
 start = time.perf_counter()
 
+global volActive, forceActive, pressureActive
+volActive = True
+forceActive = True
+pressureActive = True
+def volThread():
+    global pump, volume_time, volume_data, start, volActive
+    while pump.is_moving() and volActive:
+        volume_time.append(time.perf_counter() - start)
+        volume_data.append(pump.get_infused_vol())
+
+def forceThread():
+    global load_cell, force_time, force_data, start, pump, forceActive
+    while pump.is_moving() and forceActive:
+        force_time.append(time.perf_counter() - start)
+        force_data.append(load_cell.get_force())
+
+def pressureThread():
+    global pressure_sensor, pressure_time, pressure_data, start, pump, pressureActive
+    while pump.is_moving() and pressureActive:
+        pressure_time.append(time.perf_counter() - start)
+        pressure_data.append(pressure_sensor.get_pressure())
+        print(f"Pressure:\t {pressure_data[-1]} kPa")
+        if pressure_data[-1] > MAXIMUM_PRESSURE:
+            pump.stop()
+            print(f"Pressure Exceeded {MAXIMUM_PRESSURE} kPa.")
+            break
+
 # Simple loop to capture volume and pressure data:
-while pump.is_moving():
-    volume_time.append(time.perf_counter() - start)
-    volume_data.append(pump.get_infused_vol())
-    force_time.append(time.perf_counter() - start)
-    force_data.append(load_cell.get_force())
-    pressure_time.append(time.perf_counter() - start)
-    pressure_data.append(pressure_sensor.get_pressure())
-    print(f"Pressure:\t {pressure_data[-1]} kPa")
-    if pressure_data[-1] > MAXIMUM_PRESSURE:
-        pump.stop()
-        print(f"Pressure Exceeded {MAXIMUM_PRESSURE} kPa.")
-        break
-    # pump.set_flow_rate(new_calculated_flow_rate)
-    time.sleep(0.01)
+                # while pump.is_moving():
+                #     volume_time.append(time.perf_counter() - start)
+                #     volume_data.append(pump.get_infused_vol())
+                #     force_time.append(time.perf_counter() - start)
+                #     force_data.append(load_cell.get_force())
+                #     pressure_time.append(time.perf_counter() - start)
+                #     pressure_data.append(pressure_sensor.get_pressure())
+                #     print(f"Pressure:\t {pressure_data[-1]} kPa")
+                #     if pressure_data[-1] > MAXIMUM_PRESSURE:
+                #         pump.stop()
+                #         print(f"Pressure Exceeded {MAXIMUM_PRESSURE} kPa.")
+                #         break
+                #     # pump.set_flow_rate(new_calculated_flow_rate)
+                #     time.sleep(0.01)
+
+# start the threads
+import _thread
+_thread.start_new_thread(volThread, ())
+_thread.start_new_thread(forceThread, ())
+_thread.start_new_thread(pressureThread, ())
+
+# Write mechanism for killing the threads
+# Option 1: Manual kill switch - input field that if anything is typed and Enter is pressed, threads are killed
+# Option 2: Timer-based kill switch - after a certain amount of time, threads are killed
+
+# Option 1: Manual kill switch
+MANUAL_KILL = True
+if MANUAL_KILL:
+    dec = input("Press any key + Enter to stop the experiment: ")
+    if dec:
+        # kill the threads
+        volActive = False
+        forceActive = False
+        pressureActive = False
+
+# Option 2: Timer-based kill switch
+TIME_KILL = True
+if TIME_KILL:
+    runTimer = time.time()
+    timeToRun = 60      # seconds
+    while time.time() - runTimer < timeToRun:
+        pass
+    # kill the threads
+    volActive = False
+    forceActive = False
+    pressureActive = False
+
+# print the dimensions of the three data arrays
+print(f"# Volume Data Pts: {len(volume_data)}")
+print(f"# Pressure Data Pts: {len(pressure_data)}")
+print(f"# Force Data Pts: {len(force_data)}")
+
 
 # Write data to output.csv in rows:
 data = [volume_data, volume_time, pressure_data, pressure_time, force_time, force_data]
