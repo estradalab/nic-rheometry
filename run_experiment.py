@@ -1,153 +1,274 @@
-# Name: Volume-Controlled Cavitation Data Collection System (VCC-DCS)
-# Author: Brandon Brozich
-# Date: 7/17/2024
-# Description:
-#   Controls the volume-controlled cavitation devices for running experiments. Outputs volume readings (nL) in the first row of output.csv,
-#   and outputs pressure readings (kPa) in the third row of output.csv.
+''' Volume-Controlled Cavitation Data Collection System (VCC-DCS)
+Authors: Joseph Beckett, Brandon Brozich, and Esben Nielsen 
+Description: Script for running needle-induced cavitation experiments in a custom experimental set-up
+             developed at the University of Michigan under Prof. Jon Estrada starting in 2024. The script
+             manages test definition, data acquisition, and data export to .csv files for additional 
+             post-processing and inverse calibration of hyperelastic constituitive parameters in MATLAB.'''
 
-TARE_SENSOR = False        # Set to "True" if you want the pressure readings to be zeroed upon pressing the Run button. Set to "False" otherwise.
-LIVE_PRESSURE_READING_MODE = False    # Set to "True" if you would like to view live pressure readings without moving the syringe pump.
-LIVE_FORCE_READING_MODE = True
-                            # To stop receiving live-readings, click in the terminal where the readings are being output, and hit Ctrl-C.
-                            # Set to "False" if you do not want to view live pressure readings and instead want to run the syringe pump.
-SYRINGE_DIAMETER = 1.03     # Innder diameter of syringe in millimeters (mm).
-SYRINGE_CAPACITY = 50       # Syringe volumetric capacity in microliters (uL).
-TARGET_VOLUME = 5000       # Amount of volume to be injected in nanoliters (nL).
-FLOW_RATE = 40              # Flow rate (for constant flow rate test) in nanoliters per second (nL/sec).
-MAXIMUM_PRESSURE = 300      # Maximum pressure (kPa) before test is stopped, to prevent pressure sensor overpressuring.
-                            # Warning: Pressures may exceed this number if the ADC's maximum operating range is exceeded.
-ADC_GAIN = 32               # Gain of the ADC as set in the code.py file. Must be either 1, 2, 4, 8, 16, 32, 64, or 128.
-FUTEK_AMP_GAIN = 1015.66 # Should always be 1015.66 unless DIP switches in amplifier are changed from [0 0 0 0 1 1 1 0]
 
-#FILENAME = '20240808_NIC_Gelatin10percent-cuvette2_test_0flow.csv'
-#FILENAME = '20240809_NIC_Gelatin10percent-cuvette7_test1_withRainX_1hr_15min_wait_2000nLps.csv'
-#FILENAME = '20240809_compliancetestbubble_iinair2blahblah.csv'
-#FILENAME = '20240809_NIC_Gelatin10percent_cuvette8_test1_curedaroundneedle_RainX_curedmaybe1_5hr_godeeperandgoagain'
-#FILENAME = '20240812_NIC_Gelatin10percent_cuvetterando_test2_satinfixtureallweekend_probablydry.csv'
-#FILENAME = '20240813_NIC_PA5percent0812_cuvette1_test1_APEScoating_18ishhrwait_neverfractured.csv'
-#FILENAME = '20240819_NIC_PA5percent0816_cuvette14_test1_uncoated25Gsharp_60minwait_rate400_vol10k_retraction1mm.csv'
-#FILENAME = '20240821_LoadCellTesting_test1.csv'
-#FILENAME = 'watertestdumbgoodforce_10.csv'
-FILENAME = '20240824_NIC_PA5percent0816_cuvette4_test1_uncoated25Gsharp_5minwait_rate40_vol5k_retraction2mm.csv'
-#NOFLOWREAD = True
+#### INPUTS SECTION ####
+## Troubleshooting Commands: Set to <True> to print live volume, pressure, and force readings to the terminal without pumping fluid.
+# Note: To exit trouble shotting mode, click on the terminal where live readings are being printed and hit Ctrl+C.
+MODE_LIVE_READ = False
 
-import serial
-import time
-import math
-import csv
-import sys
-import nidaqmx # added for loadcell stuff
-import concurrent.futures
+## System Defintions: Define parameters that only change with alterations to the physical equiptment.
+DIAMETER_SYRINGE = 1.03     # Inner diameter of syringe (Hamilton Model 1705) in mm.
+CAPACITY_SYRINGE = 50       # Syringe (Hamilton Model 1705) volumetric capacity in microliters (µL).
+GAIN_FORCE_AMP = 1015.66    # Should always be 1015.66 unless DIP switches in the load cell Futek amplifier are changed from [0 0 0 0 1 1 1 0]
+GAIN_PRESSURE_AMP = 106.26  # Should always be 106.26 unless DIP switches in the load cell Futek amplifier are changed from [0 0 0 0 0 0 0 1]
+VOLTAGE_RANGE_PRESSURE = [-10.0,10.0] # Voltage range (V) of pressure readings entering DAQ. Options limited to ±0.2 V, ±1 V, ±5 V, ±10 V.
+VOLTAGE_RANGE_FORCE = [-10.0,10.0]   
+LOAD_RANGE_PRESSURE = [-68.9,413.6] # (kPa) ~ (-10 to 60 psi) Pressre extrema for Pendotech PRESS-S-000.
+LOAD_RANGE_FORCE = [-222.4,222.4] # (N) ~ (±50 lb) Force extrema for Futek LCM300.
 
-class PressureSensor:
-    def set_gain(self, gain):
-        '''Sets gain of ADC (must be either 1, 2, 4, 8, 16, 32, 64, or 128).
-            WARNING: This function is slow (~0.5 seconds to respond.)'''
-        self.serial_port.write(('GAIN:' + str(gain) + '\r').encode())
-        start = time.perf_counter()
-        while time.perf_counter() - start < 5: # Time out after 5 seconds
-            line = self.serial_port.readline().strip()
-            if line == b'': # Skip if line is blank
-                continue
-            if line[-1] == 0x03:
-                if line.strip(b'\x03')  == str(gain).encode():
-                    time.sleep(0.1) # This is here because the ADC does not respond to gain changes immediately.
-                    return
-        raise Exception("Unable to set ADC gain.")
+## Experiment Settings
+VOLUME_INJECTION = 881.8    # (nL) Amount of volume to be injected.
+FLOW_RATE = 200             # (nL/s) Constant flow rate.
 
-    def __init__(self, port):
-        self.serial_port = serial.Serial(port, 115200, timeout=1)
-        self.set_gain(ADC_GAIN)
+# Data Aquisition Settings
+# Note: If analog input (i.e., force and pressure) readings are collected in excess of 1 kHz, ensure the 'Bandwidth' setting in the amplifier is set accordingly.
+SAMPLE_RATE = 200           # (Hz) Sampling rate of all channels.                     
+WAIT_TIME_PREINJECTION = 1  # (s) Duration that force and pressure readings are collected prior to starting the injection.
+WAIT_TIME_POSTINJECTION = 1 # (s) Duration that force and pressure readings are collected after the injection is completed.
+TIMED_DAQ_END = True     # If True, data aquisition ends after WAIT_TIME_POSTINJECTION, otherwise type a character in terminal and hit ENTER to manually 
+                            # stop at any time after start of injection
+from datetime import datetime
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")  # Format: YYYYMMDD_HHMMSS
+FOLDERPATH = 'C:\\Users\\jbecktt\\Desktop\\VCC_System\\VCC_test_'+timestamp+'\\' # This folder will be made if it does not already exist.
+FILEPATH_CSV = FOLDERPATH + 'VCC_'+timestamp+'.csv'
 
-    def convert_to_kpa(data_y, gain):
-        mV_psi_V = 0.2584 # 0.2584 mV/psi/V
-        V_ref = 3.0 # reference voltage
-        fullScale_factor = 2
-        mV_psi = mV_psi_V * V_ref # mV/psi
-        V_psi = mV_psi / 1000 # V/psi
-        V_kPa = V_psi / 6.89476 # V/kPa
-        nBits = 2**24 # 24-bit ADC, i.e. 2^24 bits
-        measuredVoltage = (data_y / nBits) * V_ref
-        actualVoltage = (measuredVoltage  / gain) / fullScale_factor
-        data_y_converted = (actualVoltage / V_kPa)
-        return data_y_converted
-    
-    def get_pressure(self):
-        '''Returns float of pressure reading in kilopascal (kPa).'''
-        self.serial_port.write(b'READ\r')
-        start = time.perf_counter()
-        while time.perf_counter() - start < 5: # Time out after 5 seconds
-            line = self.serial_port.readline().strip()
-            if line == b'': # Skip if line is blank
-                continue
-            if line[-1] == 0x03:
-                return PressureSensor.convert_to_kpa(int(line.strip(b'\x03')), ADC_GAIN)
-        raise Exception("Unable to get pressure from sensor. Timed out.")
+#### CLASS DEFINITIONS ####
+import serial, time, math, csv, nidaqmx, serial.tools.list_ports, os, sys, numpy as np, _thread
+from nidaqmx.constants import AcquisitionType, TerminalConfiguration, EncoderType, AngleUnits, Edge, Level, FrequencyUnits, LoggingOperation, LoggingMode, READ_ALL_AVAILABLE
+from nptdms import TdmsFile
 
-    def tare(self):
-        '''Tares the pressure sensor.'''
-        self.serial_port.write(b'TARE\r')
-        start = time.perf_counter()
-        while time.perf_counter() - start < 5: # Time out after 5 seconds
-            line = self.serial_port.readline().strip()
-            if line == b'': # Skip if line is blank
-                continue
-            if line[-1] == 0x03:
-                if line.strip(b'\x03')  == b'SUCCESS':
-                    return
-        raise Exception("Unable to tare pressure sensor.")
+class TDMSHandler:
+    def __init__(self, folderpath,quiet=False):
+        self.folderpath = folderpath
+        self.quiet = quiet
+        self.chkdir()
 
-    def __del__(self):
-        if self.serial_port.is_open: self.serial_port.close()
+    def chkdir(self):
+        if not os.path.exists(self.folderpath):
+            try:
+                os.makedirs(self.folderpath)
+                if not self.quiet:
+                    print(f"Directory ({self.folderpath}) did not exist. New directory has been made.")
+            except:
+                raise Exception("Error making directory {self.folderpath}.")
+            
+    def chkfile(filepath):
+        if os.path.exists(filepath):
+            raise Exception("File ({filepath}) already exists. Test stopped to prevent overwriting data.")
 
-# Load Cell Class (to be implemented if necessary):
-    # function for getting force
-    # function to tare
-    # variable for storing the COM port
+    def read_tdms_data(meas_obj,raw=False):
+        with TdmsFile.read(meas_obj.filepath) as tdms_file:
+            if len(tdms_file.groups()) != 1: #or len(tdms_file.groups()[0].channels()) != 1:
+                raise Exception("TDMS file must contain exactly one group with exactly one channel. Code must be altered to accept more general data.")
+            if isinstance(meas_obj, AnalogInput):
+                data = {}
+                for i in range(len(meas_obj.ai_chan)):
+                    voltage = tdms_file["analog_in"][meas_obj.ai_chan[i]].data
+                    if raw == True:
+                        data[i] = voltage #(V)
+                    else:
+                        if meas_obj.data_type[i] == "pressure":
+                            data[i] = meas_obj._voltageV_to_pressurekPa(voltage) # (kPa)
+                        elif meas_obj.data_type[i] == "force":
+                            data[i] = meas_obj._voltageV_to_forceN(voltage) # (N)
+                        else: raise Exception("Data type not supported yet for .tdms file reading.")
+                return data
+
+            # if isinstance(meas_obj, PressureSensor):
+            #     voltage = tdms_file["pressure"][meas_obj.ai_chan].data # V
+            #     pressure = meas_obj._voltageV_to_pressurekPa(voltage) # kPa
+            #     return pressure if not raw else voltage
+            # elif isinstance(meas_obj, LoadCell):
+            #     voltage = tdms_file["force"][meas_obj.ai_chan].data # V
+            #     force = meas_obj._voltageV_to_forceN(voltage) # N
+            #     return force if not raw else voltage
+            elif isinstance(meas_obj, OpticalEncoder):
+                cnt = tdms_file["angular_disp"][meas_obj.ci_chan].raw_data # count
+                position_incr = tdms_file["angular_disp"][meas_obj.ci_chan].properties["NI_Scale[1]_PositionEncoder_Position_Increment"] # angular_disp/count
+                angle = cnt*position_incr # degree
+                volume = meas_obj._angle_deg_to_vol_nL(angle) # nL
+                return volume if not raw else cnt
+            else:
+                raise Exception("Measurement object type not supported yet for .tdms file reading.")
+
 class NIDAQTask:
     def __init__(self):
         self.task = nidaqmx.Task()
 
-    def __del__(self):
+    def start(self):
+        return self.task.start()
+    
+    def stop(self):
+        return self.task.stop()
+
+    def close(self):
         self.task.close()
 
-    def add_ai_channel(self, channel_handle, RSE_ON):
-        if RSE_ON:
-            tconfig = nidaqmx.constants.TerminalConfiguration.RSE
-        else:
-            tconfig = nidaqmx.constants.TerminalConfiguration.DEFAULT
-
-        self.task.ai_channels.add_ai_voltage_chan(physical_channel=channel_handle, terminal_config=tconfig)
+    def commit_task(self):
+        self.task.control(nidaqmx.constants.TaskMode.TASK_COMMIT) # Pre-commit some resources and settings prior to starting task to reduce lag of task.start() command
 
     def read(self):
-        return self.task.read()
+        return self.task.read()   
     
-    def print_read(self):
-        print(self.read())    
+    def read_all(self):
+        return self.task.read(number_of_samples_per_channel=READ_ALL_AVAILABLE) # If sample mode is CONTINUOUS, all data points currently buffer are read.
+                                                                                # If sample mode is FINITE, the code waits until the task is finished and then reads the buffer.
 
-class LoadCell(NIDAQTask):
-    def __init__(self, channel_handle, RSE_ON, gain):
-        NIDAQTask.__init__(self)
-        NIDAQTask.add_ai_channel(self, channel_handle, RSE_ON)
+class OpticalEncoder(NIDAQTask):
+    def __init__(self, ci_chan, decoding_type, diameter_syringe, filepath, pulse_gen=None, sample_rate=None, n_samples=None, sample_mode=AcquisitionType.CONTINUOUS):
+        super().__init__()
+        units = AngleUnits.DEGREES
+        pulses_per_rev = 100 # E4T encoder spec
+        self.task.ci_channels.add_ci_ang_encoder_chan(counter=ci_chan,
+                                                      decoding_type=decoding_type,
+                                                      pulses_per_rev=pulses_per_rev,
+                                                      units=units,
+                                                      initial_angle=0.0,
+                                                      zidx_enable=False # E4T encoder does not have z-index channel
+                                                      )
+        if isinstance(pulse_gen,PulseGenerator): # Set time source to pulse generator (if provided)
+            self.task.timing.cfg_samp_clk_timing(rate=pulse_gen.sample_rate,
+                                                 source=pulse_gen.co_pulse_term,
+                                                 active_edge=Edge.RISING,
+                                                 sample_mode=pulse_gen.sample_mode,
+                                                 samps_per_chan=pulse_gen.samps_per_chan)
+        elif sample_rate is not None:
+            if n_samples is not None:
+                self.task.timing.cfg_samp_clk_timing(rate=sample_rate,
+                                        sample_mode=sample_mode,
+                                        samps_per_chan=n_samples) # Including n_samples is necessary for AcquisitionType.FINITE, but it is helpful for estimating memory usage in AcquisitionType.CONTINUOUS mode
+            else:
+                self.task.timing.cfg_samp_clk_timing(sample_rate=sample_rate,
+                                        sample_mode=sample_mode)
+        if isinstance(pulse_gen,PulseGenerator) or sample_rate is not None:
+            TDMSHandler.chkfile(filepath)
+            self.task.in_stream.configure_logging(filepath,
+                                                  LoggingMode.LOG_AND_READ,    
+                                                  group_name='angular_disp',
+                                                  operation=LoggingOperation.CREATE) # Create a new TDMS file. If the file already exists, NI-DAQmx returns an error.
+        self.ci_chan = ci_chan
+        self.diameter_syringe = diameter_syringe
+        self.filepath = filepath
+
+    def _angle_deg_to_vol_nL(self,angle_deg):
+        gear_ratio = 1/2.4
+        factor = gear_ratio*(1/24)*(25400/1)*(1/360)*10**-3 # mm/°of spindle rotation
+        A_syringe = math.pi*(self.diameter_syringe/2)**2 # mm^2
+        vol = angle_deg*factor*A_syringe # mm^3 or μL
+        return vol*10**3 # nL
+
+    def read_volume(self):
+        return self._angle_deg_to_vol_nL(self.read())
+    
+    def print_volume(self):
+        print("%.3f nL" % self.read_volume())
+
+class AnalogInput(NIDAQTask):
+    def __init__(self, ai_chan, data_type, gain, ai_range_V, ai_range_conv, filepath, pulse_gen=None, sample_rate=None, n_samples=None, sample_mode=AcquisitionType.CONTINUOUS):
+        super().__init__() # Ensures that NIDAQTask Class is also initialized
+        for i in range(len(ai_chan)):
+            self.task.ai_channels.add_ai_voltage_chan(physical_channel=ai_chan[i], 
+                                                      terminal_config=TerminalConfiguration.DIFF, # reflects currently wiring (decision informed by NI best practices)
+                                                      min_val = ai_range_V[i][0], max_val = ai_range_V[i][1])
+        if isinstance(pulse_gen,PulseGenerator): # Set time source to pulse generator (if provided)
+            self.task.timing.cfg_samp_clk_timing(rate=pulse_gen.sample_rate, 
+                                                    source=pulse_gen.co_pulse_term, 
+                                                    active_edge=Edge.RISING, 
+                                                    sample_mode=pulse_gen.sample_mode)
+        elif sample_rate is not None:
+            if n_samples is not None:
+                self.task.timing.cfg_samp_clk_timing(rate=sample_rate,
+                                        sample_mode=sample_mode,
+                                        samps_per_chan=n_samples) # Including n_samples is necessary for AcquisitionType.FINITE, but it is helpful for estimating memory usage in AcquisitionType.CONTINUOUS mode
+            else:
+                self.task.timing.cfg_samp_clk_timing(sample_rate=sample_rate,
+                                        sample_mode=sample_mode)
+        if isinstance(pulse_gen,PulseGenerator) or sample_rate is not None:
+            TDMSHandler.chkfile(filepath)
+            self.task.in_stream.configure_logging(filepath,
+                                                  LoggingMode.LOG_AND_READ,
+                                                  group_name='analog_in',
+                                                  operation=LoggingOperation.CREATE) # Create a new TDMS file. If the file already exists, NI-DAQmx returns an error.
+        self.ai_chan = ai_chan
+        self.data_type = data_type
         self.gain = gain
+        self.ai_range_V = ai_range_V
+        self.ai_range_conv = ai_range_conv
+        self.filepath = filepath
+        self._get_overvoltage_limits()
 
-    def convert_to_N(self,voltage):
+    def _voltageV_to_pressurekPa(self,voltage):
+        mV_psi_Vexic = 0.2584 # mV/psi
+        Vexcit = 10 # excitation voltage of pressure sensor (V)
+        kPa_psi = 6.8947572932 # kPa/psi
+        mV_kPa = mV_psi_Vexic*Vexcit/kPa_psi
+        pressure = voltage*10**3/(self.gain[self.data_type.index("pressure")]*mV_kPa) # kPa
+        return pressure
+    
+    def read_pressure(self):
+        voltage = self.read()
+        return self._voltageV_to_pressurekPa(voltage[self.data_type.index("pressure")]) # only print the most recent value
+
+    def print_pressure(self):
+        print("%.3f kPa" % self.read_pressure())
+
+    def _voltageV_to_forceN(self,voltage):
         N_lb = 4.44822 # N/lb conversion
         FSR = 50 # full-scale-range on loadcell (lb)
         Vexcit = 10 # excitation voltage of loadcell (V)
         RO = 1 # rated output of load cell (mV/V)
-        sensitivity = FSR/(Vexcit*RO*10**-3*self.gain) # lb/V
+        sensitivity = FSR/(Vexcit*RO*10**-3*self.gain[self.data_type.index("force")]) # lb/V
         force = sensitivity*voltage*N_lb # N
         return force
-
-    def get_voltage(self):
-        return self.read()
     
-    def get_force(self):
-        return self.convert_to_N(self.read())
+    def read_force(self):
+        voltage = self.read()
+        return self._voltageV_to_forceN(voltage[self.data_type.index("force")]) # only print the most recent value
 
-    def print_voltage(self):
-        print("%.3f V" % self.read())
+    def print_force(self):
+        print("%.3f N" % self.read_force())
+    
+    def _get_overvoltage_limits(self):
+        self.overvoltage_range = {}; self.overload = {}
+        for i in range(len(self.ai_chan)):
+            if self.data_type[i] == "force":
+                Vlim_low = [self.ai_range_V[i][0],self.ai_range_conv[i][0]/self._voltageV_to_forceN(1)]
+                Vlim_high = [self.ai_range_V[i][1],self.ai_range_conv[i][1]/self._voltageV_to_forceN(1)]
+            elif self.data_type[i] == "pressure":
+                Vlim_low = [self.ai_range_V[i][0],self.ai_range_conv[i][0]/self._voltageV_to_pressurekPa(1)]
+                Vlim_high = [self.ai_range_V[i][1],self.ai_range_conv[i][1]/self._voltageV_to_pressurekPa(1)]
+            else: raise Exception("Data type not supported yet for overvoltage protection.")
+            self.overvoltage_range[i] = [max(Vlim_low), min(Vlim_high)]
+            self.overload[i] = [Vlim_low.index(self.overvoltage_range[i][0]), Vlim_high.index(self.overvoltage_range[i][1])]
+
+    def safe_voltage_check(self,data):
+        data = np.array(data)
+        for i in range(len(self.ai_chan)):
+            overvoltage = np.any(data[i] < self.overvoltage_range[i][0]) or np.any(data[i] > self.overvoltage_range[i][1])
+            if overvoltage == True:
+                return False
+            else : return True
+    
+class PulseGenerator(NIDAQTask):
+    def __init__(self,co_pulse_term,co_chan,sample_rate,n_samples=None,idle_state=Level.LOW,initial_delay=0.0,duty_cycle=0.5):
+        super().__init__()
+        sample_mode = AcquisitionType.CONTINUOUS
+        co_channel = self.task.co_channels.add_co_pulse_chan_freq(co_chan, idle_state=idle_state, 
+                                                             initial_delay=initial_delay, 
+                                                             freq=sample_rate, 
+                                                             duty_cycle=duty_cycle, 
+                                                             units=FrequencyUnits.HZ)
+        co_channel.co_pulse_term = co_pulse_term # Output pulse train on a specified terminal (PFI line)
+        self.task.timing.cfg_implicit_timing(sample_mode=sample_mode)
+        self.co_pulse_term = co_pulse_term
+        self.sample_rate = sample_rate
+        self.samps_per_chan = n_samples
+        self.sample_mode = sample_mode
 
 class SyringePump:
     def query(self, command):
@@ -166,7 +287,7 @@ class SyringePump:
 
     
     def __init__(self, port):
-        self.serial_port = serial.Serial(port, 115200, timeout=1)
+        self.serial_port = serial.Serial(port, 115200, timeout=1) # Opens serial connection with syringe pump (~3.5 ms response time)
         self.query('poll on') # 'poll on' must be the first query sent to the syringe pump.
 
     def is_moving(self):
@@ -281,57 +402,110 @@ class SyringePump:
     def __del__(self):
         if self.serial_port.is_open: self.serial_port.close()
 
-# Initializing pump & pressure sensor:
-pump = SyringePump('COM3') # Syringe pump has ~3.5 ms response time
-pressure_sensor = PressureSensor('COM7') # Pressure sensor has ~12 ms response time (can be a little faster but becomes a bit unstable)
-load_cell = LoadCell('Dev9/ai0', True, FUTEK_AMP_GAIN)
+#### TEST SET-UP ####
+if not MODE_LIVE_READ: TDMSHandler(FOLDERPATH)
+global pump, analog_in, TEST_ACTIVE
+## Initializing Syringe Pump and Sensors
+pump = SyringePump('COM4')
+pump.set_syringe_dims(DIAMETER_SYRINGE, CAPACITY_SYRINGE)
+duration_injection = VOLUME_INJECTION/FLOW_RATE
+time_DAQ_record = WAIT_TIME_PREINJECTION + duration_injection + WAIT_TIME_POSTINJECTION
+n_samples = math.ceil(time_DAQ_record*SAMPLE_RATE)
+pulse_gen = PulseGenerator('/Dev2/PFI12','/Dev2/ctr1',SAMPLE_RATE,n_samples) if not MODE_LIVE_READ else None
+encoder_type = EncoderType.X_4 # X_2 is generally has lower resolution than X_4, but is less sensitive to vibrations
+optical_encoder = OpticalEncoder('Dev2/ctr0', encoder_type, DIAMETER_SYRINGE, FOLDERPATH+'angular_disp.tdms', pulse_gen)
+analog_in = AnalogInput(['Dev2/ai0','Dev2/ai1'], ["pressure","force"], [GAIN_PRESSURE_AMP, GAIN_FORCE_AMP], [VOLTAGE_RANGE_PRESSURE,VOLTAGE_RANGE_FORCE], [LOAD_RANGE_PRESSURE,LOAD_RANGE_FORCE], FOLDERPATH+'analog_in.tdms', pulse_gen)
 
-# Tare pressure readings:
-if TARE_SENSOR:
-    pressure_sensor.tare()
-    print("Pressure Sensor tared.")
-    sys.exit()
+# Start system protection thread to protect from overvoltage of DAQ or overload of sensor(s)
+def overvoltage_protect_thread():
+    global pump, analog_in, TEST_ACTIVE
+    while TEST_ACTIVE:
+        ai_data = analog_in.read() if MODE_LIVE_READ else analog_in.read() # the latter was changed from read_all() to read() during troubleshooting!!!
+        if MODE_LIVE_READ == True: 
+            time.sleep(0.001)
+        safe_voltage = analog_in.safe_voltage_check(ai_data)
+        if not safe_voltage:
+            TEST_ACTIVE = False
+            pump.stop()
+            print("NIC Update: Pump stopped due to overvoltage.")
 
-# While loop for seeing pressure readings live (hit Ctrl-C in the terminal to stop):
-while LIVE_PRESSURE_READING_MODE:
-    print(f"Pressure:\t {pressure_sensor.get_pressure()} kPa")
-    time.sleep(0.25)
+def print_live_sensor_readout(t_wait=0.1):
+    try: 
+        while MODE_LIVE_READ:
+            vol_str = "Volume: %.3f nL" % optical_encoder.read_volume()
+            pressure_str = "Pressure: %.3f kPa" % analog_in.read_pressure()
+            force_str = "Force: %.3f N" % analog_in.read_force()
+            print(f"{vol_str}\t{pressure_str}\t{force_str}", end="\r")
+            time.sleep(t_wait) 
+    except nidaqmx.DaqError as e:
+        print('An error occurred during live reading mode: ', e)
+    except KeyboardInterrupt:
+        print("\nLive reading mode stopped by user")
+    finally: 
+        optical_encoder.stop(); optical_encoder.close()
+        analog_in.stop(); analog_in.close()
+    sys.exit() # Exit script after live reading mode is stopped
 
-while LIVE_FORCE_READING_MODE:
-    print(f"Force:\t {load_cell.get_force()} N")
-    time.sleep(0.25)
+#### RUN VCC TEST ####
+## Start Data Acquisition and Injection
+TEST_ACTIVE = True
+optical_encoder.start()
+analog_in.start()
+_thread.start_new_thread(overvoltage_protect_thread,())
+if MODE_LIVE_READ:
+    print_live_sensor_readout()
+elif TIMED_DAQ_END == True:
+    print(f'NIC Update:  the total duration of the test will be {time_DAQ_record} s.')
 
-volume_time = []
-volume_data = []
-pressure_time = []
-pressure_data = []
-force_time = []
-force_data = []
+pulse_gen.start() # Start pulse generator last to trigger start of all other syncronized tasks
+print("NIC Update: Data aquisition started.")
+time.sleep(WAIT_TIME_PREINJECTION)
+if TEST_ACTIVE: pump.infuse_const_rate(VOLUME_INJECTION, FLOW_RATE)
+start_time_injection = time.perf_counter()
+print("NIC Update: Pump successfully started.")
 
-pump.set_syringe_dims(SYRINGE_DIAMETER, SYRINGE_CAPACITY)
-pump.infuse_const_rate(TARGET_VOLUME, FLOW_RATE)
-start = time.perf_counter()
+## Setting Method for Thread Termination
+if TIMED_DAQ_END:
+    while TEST_ACTIVE and time.perf_counter() - start_time_injection < (duration_injection + WAIT_TIME_POSTINJECTION):
+        time.sleep(0.001)
+    TEST_ACTIVE = False
+else: 
+    manual_stop_str = input("Press any key + Enter to stop the experiment: ")
+    if manual_stop_str:
+        TEST_ACTIVE = False
+pulse_gen.stop()
+print("NIC Update: Injection and data aquisition completed. Starting to clean-up DAQ tasks.")
+optical_encoder.read_all(); analog_in.read_all() # Only necessary if using TDMS file reading with LoggingMode.LOG_AND_READ
+optical_encoder.stop(); analog_in.stop()
+pulse_gen.close(); optical_encoder.close(); analog_in.close()
 
-# Simple loop to capture volume and pressure data:
-while pump.is_moving():
-    volume_time.append(time.perf_counter() - start)
-    volume_data.append(pump.get_infused_vol())
-    force_time.append(time.perf_counter() - start)
-    force_data.append(load_cell.get_force())
-    pressure_time.append(time.perf_counter() - start)
-    pressure_data.append(pressure_sensor.get_pressure())
-    print(f"Pressure:\t {pressure_data[-1]} kPa")
-    if pressure_data[-1] > MAXIMUM_PRESSURE:
-        pump.stop()
-        print(f"Pressure Exceeded {MAXIMUM_PRESSURE} kPa.")
-        break
-    # pump.set_flow_rate(new_calculated_flow_rate)
-    time.sleep(0.01)
+print("NIC Update: Reading data from binary TDMS files.")
+vol_data = TDMSHandler.read_tdms_data(optical_encoder) # (nL)
+analog_in_data = TDMSHandler.read_tdms_data(analog_in) # (V)
+pressure_data = analog_in_data[0] # (kPa)
+force_data = analog_in_data[1] # (N)
+if not len(vol_data) == len(pressure_data) == len(force_data):
+    print("WARNING: Data lengths are not equal. Something has gone wrong.")
+t = np.arange(len(vol_data))/SAMPLE_RATE
 
-# Write data to output.csv in rows:
-data = [volume_data, volume_time, pressure_data, pressure_time, force_time, force_data]
-file = open(FILENAME, 'w', newline ='')
+#### TEST OVERVIEW AND SAVIING ####
+## Print Brief Test Overview
+print("-----------------TEST OVERVIEW-----------------")
+print(f'The maximum pressure was {max(pressure_data)} kPa')
+print(f'The volume at maximum pressure was {vol_data[np.argmax(pressure_data)]} nL')
+print("-----------------------------------------------")
+
+## Write Data to a .csv File:
+data_name = ["t","volume","pressure","force"]
+data_unit = ["s","nL","kPa","N"]
+data = [t, vol_data, pressure_data, force_data]
+max_length = max(len(lst) for lst in data)
+padded_data = [lst + [None] * (max_length - len(lst)) if max_length - len(lst) > 0 else lst for lst in data]
+file = open(FILEPATH_CSV, 'w', newline ='')
 with file:
     write = csv.writer(file)
-    write.writerows(data)
+    write.writerow(data_name)
+    write.writerow(data_unit)
+    write.writerows(zip(*padded_data))
 file.close()
+print(f"NIC Update: Data successfully written to {FILEPATH_CSV}.")
