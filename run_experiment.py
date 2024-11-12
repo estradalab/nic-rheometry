@@ -210,9 +210,9 @@ class AnalogInput(NIDAQTask):
         pressure = voltage*10**3/(self.gain[self.data_type.index("pressure")]*mV_kPa) # kPa
         return pressure
     
-    def read_pressure(self):
+    def read_pressure(self,raw = False):
         voltage = self.read()
-        return self._voltageV_to_pressurekPa(voltage[self.data_type.index("pressure")]) # only print the most recent value
+        return self._voltageV_to_pressurekPa(voltage[self.data_type.index("pressure")]) if not raw else voltage[self.data_type.index("pressure")] # only print the most recent value
 
     def print_pressure(self):
         print("%.3f kPa" % self.read_pressure())
@@ -226,9 +226,9 @@ class AnalogInput(NIDAQTask):
         force = sensitivity*voltage*N_lb # N
         return force
     
-    def read_force(self):
+    def read_force(self, raw = False):
         voltage = self.read()
-        return self._voltageV_to_forceN(voltage[self.data_type.index("force")]) # only print the most recent value
+        return self._voltageV_to_forceN(voltage[self.data_type.index("force")]) if not raw else voltage[self.data_type.index("force")] # only print the most recent value
 
     def print_force(self):
         print("%.3f N" % self.read_force())
@@ -432,9 +432,11 @@ def overvoltage_protect_thread():
 def print_live_sensor_readout(t_wait=0.1):
     try: 
         while MODE_LIVE_READ:
-            vol_str = "Volume: %.3f nL" % optical_encoder.read_volume()
-            pressure_str = "Pressure: %.3f kPa" % analog_in.read_pressure()
-            force_str = "Force: %.3f N" % analog_in.read_force()
+            vol_str = "Volume: %.3f nL  " % optical_encoder.read_volume()
+            pressure_V = analog_in.read_pressure(raw=True)
+            pressure_str = "Pressure: %.3f kPa (%.5f V)  " % (analog_in._voltageV_to_pressurekPa(pressure_V), pressure_V)
+            force_V = analog_in.read_force(raw=True)
+            force_str = "Force: %.3f N (%.5f V)  " % (analog_in._voltageV_to_forceN(force_V), force_V)
             print(f"{vol_str}\t{pressure_str}\t{force_str}", end="\r")
             time.sleep(t_wait) 
     except nidaqmx.DaqError as e:
