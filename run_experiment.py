@@ -428,7 +428,6 @@ def overvoltage_protect_thread():
             TEST_ACTIVE = False
             pump.stop()
             print("NIC Update: Pump stopped due to overvoltage.")
-
 def print_live_sensor_readout(t_wait=0.1):
     try: 
         while MODE_LIVE_READ:
@@ -447,6 +446,16 @@ def print_live_sensor_readout(t_wait=0.1):
         optical_encoder.stop(); optical_encoder.close()
         analog_in.stop(); analog_in.close()
     sys.exit() # Exit script after live reading mode is stopped
+def write_csv(filename, data_name, data_unit, data):
+    max_length = max(len(lst) for lst in data)
+    padded_data = [lst + [None] * (max_length - len(lst)) if max_length - len(lst) > 0 else lst for lst in data]
+    file = open(filename, 'w', newline ='')
+    with file:
+        write = csv.writer(file)
+        write.writerow(data_name)
+        write.writerow(data_unit)
+        write.writerows(zip(*padded_data))
+    file.close()
 
 #### RUN VCC TEST ####
 ## Start Data Acquisition and Injection
@@ -501,13 +510,5 @@ print("-----------------------------------------------")
 data_name = ["t","volume","pressure","force"]
 data_unit = ["s","nL","kPa","N"]
 data = [t, vol_data, pressure_data, force_data]
-max_length = max(len(lst) for lst in data)
-padded_data = [lst + [None] * (max_length - len(lst)) if max_length - len(lst) > 0 else lst for lst in data]
-file = open(FILEPATH_CSV, 'w', newline ='')
-with file:
-    write = csv.writer(file)
-    write.writerow(data_name)
-    write.writerow(data_unit)
-    write.writerows(zip(*padded_data))
-file.close()
+write_csv(FILEPATH_CSV, data_name, data_unit, data)
 print(f"NIC Update: Data successfully written to {FILEPATH_CSV}.")
