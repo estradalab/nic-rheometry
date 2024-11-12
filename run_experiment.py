@@ -7,27 +7,29 @@ Description: Script for running needle-induced cavitation experiments in a custo
 
 
 #### INPUTS SECTION ####
-## Troubleshooting Commands: Set to <True> to print live volume, pressure, and force readings to the terminal without pumping fluid.
-# Note: To exit trouble shotting mode, click on the terminal where live readings are being printed and hit Ctrl+C.
-MODE_LIVE_READ = False
+## Test Method: Select the mode of operation for the script.
+# LIVE_READ: Readout of sensor data is provided in real-time in the terminal. The pump is not actuated by the script. 
+# VCC_CONSTANT_RATE: The pump is actuated to infuse a constant volume at a constant rate. Sensor data is recorded and saved to a .csv file.
+# CALIBRATE_FRICTION: Run VCC_CONSTANT_RATE test with 5 repeated injections of 0.5 second durations with short pauses between to calibrate frictional forces for current FLOW_RATE.
+MODE = "LIVE_READ"
 
 ## System Defintions: Define parameters that only change with alterations to the physical equiptment.
 DIAMETER_SYRINGE = 1.03     # Inner diameter of syringe (Hamilton Model 1705) in mm.
 CAPACITY_SYRINGE = 50       # Syringe (Hamilton Model 1705) volumetric capacity in microliters (µL).
+GAIN_PRESSURE_AMP = 368.04  # Should always be 368.04 unless DIP switches in the load cell Futek amplifier are changed from [0 0 0 0 0 0 1 1]
 GAIN_FORCE_AMP = 1015.66    # Should always be 1015.66 unless DIP switches in the load cell Futek amplifier are changed from [0 0 0 0 1 1 1 0]
-GAIN_PRESSURE_AMP = 106.26  # Should always be 106.26 unless DIP switches in the load cell Futek amplifier are changed from [0 0 0 0 0 0 0 1]
 VOLTAGE_RANGE_PRESSURE = [-10.0,10.0] # Voltage range (V) of pressure readings entering DAQ. Options limited to ±0.2 V, ±1 V, ±5 V, ±10 V.
 VOLTAGE_RANGE_FORCE = [-10.0,10.0]   
 LOAD_RANGE_PRESSURE = [-68.9,413.6] # (kPa) ~ (-10 to 60 psi) Pressre extrema for Pendotech PRESS-S-000.
 LOAD_RANGE_FORCE = [-222.4,222.4] # (N) ~ (±50 lb) Force extrema for Futek LCM300.
 
 ## Experiment Settings
-VOLUME_INJECTION = 881.8    # (nL) Amount of volume to be injected.
-FLOW_RATE = 200             # (nL/s) Constant flow rate.
+VOLUME_INJECTION = 100    # (nL) Amount of volume to be injected.
+FLOW_RATE = 100             # (nL/s) Constant flow rate.
 
 # Data Aquisition Settings
 # Note: If analog input (i.e., force and pressure) readings are collected in excess of 1 kHz, ensure the 'Bandwidth' setting in the amplifier is set accordingly.
-SAMPLE_RATE = 200           # (Hz) Sampling rate of all channels.                     
+SAMPLE_RATE = 2000           # (Hz) Sampling rate of all channels.                     
 WAIT_TIME_PREINJECTION = 1  # (s) Duration that force and pressure readings are collected prior to starting the injection.
 WAIT_TIME_POSTINJECTION = 1 # (s) Duration that force and pressure readings are collected after the injection is completed.
 TIMED_DAQ_END = True     # If True, data aquisition ends after WAIT_TIME_POSTINJECTION, otherwise type a character in terminal and hit ENTER to manually 
@@ -403,7 +405,7 @@ class SyringePump:
         if self.serial_port.is_open: self.serial_port.close()
 
 #### TEST SET-UP ####
-if not MODE_LIVE_READ: TDMSHandler(FOLDERPATH)
+if not MODE == "LIVE_READ": TDMSHandler(FOLDERPATH)
 global pump, analog_in, TEST_ACTIVE
 ## Initializing Syringe Pump and Sensors
 pump = SyringePump('COM4')
@@ -411,7 +413,7 @@ pump.set_syringe_dims(DIAMETER_SYRINGE, CAPACITY_SYRINGE)
 duration_injection = VOLUME_INJECTION/FLOW_RATE
 time_DAQ_record = WAIT_TIME_PREINJECTION + duration_injection + WAIT_TIME_POSTINJECTION
 n_samples = math.ceil(time_DAQ_record*SAMPLE_RATE)
-pulse_gen = PulseGenerator('/Dev2/PFI12','/Dev2/ctr1',SAMPLE_RATE,n_samples) if not MODE_LIVE_READ else None
+pulse_gen = PulseGenerator('/Dev2/PFI12','/Dev2/ctr1',SAMPLE_RATE,n_samples) if not MODE == "LIVE_READ" else None
 encoder_type = EncoderType.X_4 # X_2 is generally has lower resolution than X_4, but is less sensitive to vibrations
 optical_encoder = OpticalEncoder('Dev2/ctr0', encoder_type, DIAMETER_SYRINGE, FOLDERPATH+'angular_disp.tdms', pulse_gen)
 analog_in = AnalogInput(['Dev2/ai0','Dev2/ai1'], ["pressure","force"], [GAIN_PRESSURE_AMP, GAIN_FORCE_AMP], [VOLTAGE_RANGE_PRESSURE,VOLTAGE_RANGE_FORCE], [LOAD_RANGE_PRESSURE,LOAD_RANGE_FORCE], FOLDERPATH+'analog_in.tdms', pulse_gen)
@@ -419,33 +421,18 @@ analog_in = AnalogInput(['Dev2/ai0','Dev2/ai1'], ["pressure","force"], [GAIN_PRE
 # Start system protection thread to protect from overvoltage of DAQ or overload of sensor(s)
 def overvoltage_protect_thread():
     global pump, analog_in, TEST_ACTIVE
-    while TEST_ACTIVE:
-        ai_data = analog_in.read() if MODE_LIVE_READ else analog_in.read() # the latter was changed from read_all() to read() during troubleshooting!!!
-        if MODE_LIVE_READ == True: 
-            time.sleep(0.001)
-        safe_voltage = analog_in.safe_voltage_check(ai_data)
-        if not safe_voltage:
-            TEST_ACTIVE = False
-            pump.stop()
-            print("NIC Update: Pump stopped due to overvoltage.")
-def print_live_sensor_readout(t_wait=0.1):
-    try: 
-        while MODE_LIVE_READ:
-            vol_str = "Volume: %.3f nL  " % optical_encoder.read_volume()
-            pressure_V = analog_in.read_pressure(raw=True)
-            pressure_str = "Pressure: %.3f kPa (%.5f V)  " % (analog_in._voltageV_to_pressurekPa(pressure_V), pressure_V)
-            force_V = analog_in.read_force(raw=True)
-            force_str = "Force: %.3f N (%.5f V)  " % (analog_in._voltageV_to_forceN(force_V), force_V)
-            print(f"{vol_str}\t{pressure_str}\t{force_str}", end="\r")
-            time.sleep(t_wait) 
+    try:
+        while TEST_ACTIVE:
+            ai_data = analog_in.read()
+            if MODE == "LIVE_READ" == True: 
+                time.sleep(0.001)
+            safe_voltage = analog_in.safe_voltage_check(ai_data)
+            if not safe_voltage:
+                TEST_ACTIVE = False
+                pump.stop()
+                print("NIC Update: Pump stopped due to protect system from overvoltage/overload.")
     except nidaqmx.DaqError as e:
-        print('An error occurred during live reading mode: ', e)
-    except KeyboardInterrupt:
-        print("\nLive reading mode stopped by user")
-    finally: 
-        optical_encoder.stop(); optical_encoder.close()
-        analog_in.stop(); analog_in.close()
-    sys.exit() # Exit script after live reading mode is stopped
+        if TEST_ACTIVE: print("Overvoltage protection thread stopped due to error: ", e)
 def write_csv(filename, data_name, data_unit, data):
     max_length = max(len(lst) for lst in data)
     padded_data = [lst + [None] * (max_length - len(lst)) if max_length - len(lst) > 0 else lst for lst in data]
@@ -457,58 +444,101 @@ def write_csv(filename, data_name, data_unit, data):
         write.writerows(zip(*padded_data))
     file.close()
 
+class NICTestMethod:
+    def __init__(self,test):
+        self.test = test
+        if test == "LIVE_READ":
+            self.print_live_sensor_readout()
+        elif test == "VCC_CONSTANT_RATE":
+            self.vcc_constant_rate()
+        elif test == "CALIBRATE_FRICTION":
+            self.vcc_constant_rate(calibrate_friction=True)
+        
+    def print_live_sensor_readout(self,t_wait=0.1):
+        global TEST_ACTIVE
+        _thread.start_new_thread(overvoltage_protect_thread,())
+        try: 
+            while True:
+                vol_str = "Volume: %.3f nL  " % optical_encoder.read_volume()
+                pressure_V = analog_in.read_pressure(raw=True)
+                pressure_str = "Pressure: %.3f kPa (%.5f V)  " % (analog_in._voltageV_to_pressurekPa(pressure_V), pressure_V)
+                force_V = analog_in.read_force(raw=True)
+                force_str = "Force: %.3f N (%.5f V)  " % (analog_in._voltageV_to_forceN(force_V), force_V)
+                print(f"{vol_str}\t{pressure_str}\t{force_str}", end="\r")
+                time.sleep(t_wait) 
+        except nidaqmx.DaqError as e:
+            TEST_ACTIVE = False
+            print('An error occurred during live reading mode: ', e)
+        except KeyboardInterrupt:
+            TEST_ACTIVE = False
+            print("\nLive reading mode stopped by user")
+        finally: 
+            optical_encoder.close(); analog_in.close()
+            time.sleep(3)
+        sys.exit() # Exit script after live reading mode is stopped
+    def vcc_constant_rate(self,calibrate_friction=False):
+        global TEST_ACTIVE
+        ## Prepare DAQ for test
+        if TIMED_DAQ_END:
+            print(f'NIC Update:  the total duration of the test will be {time_DAQ_record} s.')
+        optical_encoder.start()
+        analog_in.start()
+        _thread.start_new_thread(overvoltage_protect_thread,())
+        ## Start of data aquisition and test
+        pulse_gen.start() # Start pulse generator last to trigger start of all other syncronized tasks
+        print("NIC Update: Data aquisition started.")
+        if not calibrate_friction:
+            time.sleep(WAIT_TIME_PREINJECTION)
+            if TEST_ACTIVE: pump.infuse_const_rate(VOLUME_INJECTION, FLOW_RATE)
+            start_time_injection = time.perf_counter()
+            print("NIC Update: Pump successfully started.")
+            ## Setting Method for Thread Termination
+            if TIMED_DAQ_END:
+                while TEST_ACTIVE and time.perf_counter() - start_time_injection < (duration_injection + WAIT_TIME_POSTINJECTION):
+                    time.sleep(0.001)
+                TEST_ACTIVE = False
+            else: 
+                manual_stop_str = input("Press any key + Enter to stop the experiment: ")
+                if manual_stop_str:
+                    TEST_ACTIVE = False
+        elif calibrate_friction:
+            n = 0
+            time.sleep(0.25)
+            while n < 5: # run 5 cycles
+                n += 1
+                if TEST_ACTIVE: pump.infuse_const_rate(FLOW_RATE*0.5, FLOW_RATE)
+                time.sleep(0.6) # wait a full second (half second of this time will be used for injection)
+            TEST_ACTIVE = False
+        pulse_gen.stop()
+        print("NIC Update: Injection and data aquisition completed. Starting to clean-up DAQ tasks.")
+        optical_encoder.read_all(); analog_in.read_all() # Only necessary if using TDMS file reading with LoggingMode.LOG_AND_READ
+        optical_encoder.stop(); analog_in.stop()
+        pulse_gen.close(); optical_encoder.close(); analog_in.close()
+
+        print("NIC Update: Reading data from binary TDMS files.")
+        vol_data = TDMSHandler.read_tdms_data(optical_encoder) # (nL)
+        analog_in_data = TDMSHandler.read_tdms_data(analog_in) # (V)
+        pressure_data = analog_in_data[0] # (kPa)
+        force_data = analog_in_data[1] # (N)
+        if not len(vol_data) == len(pressure_data) == len(force_data):
+            print("WARNING: Data lengths are not equal. Something has gone wrong.")
+        t = np.arange(len(vol_data))/SAMPLE_RATE
+        ## Print Brief Test Overview
+        print("-----------------TEST OVERVIEW-----------------")
+        print(f'The maximum pressure was {max(pressure_data)} kPa')
+        print(f'The volume at maximum pressure was {vol_data[np.argmax(pressure_data)]} nL')
+        print("-----------------------------------------------")
+        ## Write Data to a .csv File:
+        data_name = ["t","volume","pressure","force"]
+        data_unit = ["s","nL","kPa","N"]
+        data = [t, vol_data, pressure_data, force_data]
+        write_csv(FILEPATH_CSV, data_name, data_unit, data)
+        print(f"NIC Update: Data successfully written to {FILEPATH_CSV}.")
+
 #### RUN VCC TEST ####
 ## Start Data Acquisition and Injection
 TEST_ACTIVE = True
-optical_encoder.start()
-analog_in.start()
-_thread.start_new_thread(overvoltage_protect_thread,())
-if MODE_LIVE_READ:
-    print_live_sensor_readout()
-elif TIMED_DAQ_END == True:
-    print(f'NIC Update:  the total duration of the test will be {time_DAQ_record} s.')
-
-pulse_gen.start() # Start pulse generator last to trigger start of all other syncronized tasks
-print("NIC Update: Data aquisition started.")
-time.sleep(WAIT_TIME_PREINJECTION)
-if TEST_ACTIVE: pump.infuse_const_rate(VOLUME_INJECTION, FLOW_RATE)
-start_time_injection = time.perf_counter()
-print("NIC Update: Pump successfully started.")
-
-## Setting Method for Thread Termination
-if TIMED_DAQ_END:
-    while TEST_ACTIVE and time.perf_counter() - start_time_injection < (duration_injection + WAIT_TIME_POSTINJECTION):
-        time.sleep(0.001)
-    TEST_ACTIVE = False
+if MODE in ["LIVE_READ", "VCC_CONSTANT_RATE", "CALIBRATE_FRICTION"]:
+    NICTestMethod(MODE)
 else: 
-    manual_stop_str = input("Press any key + Enter to stop the experiment: ")
-    if manual_stop_str:
-        TEST_ACTIVE = False
-pulse_gen.stop()
-print("NIC Update: Injection and data aquisition completed. Starting to clean-up DAQ tasks.")
-optical_encoder.read_all(); analog_in.read_all() # Only necessary if using TDMS file reading with LoggingMode.LOG_AND_READ
-optical_encoder.stop(); analog_in.stop()
-pulse_gen.close(); optical_encoder.close(); analog_in.close()
-
-print("NIC Update: Reading data from binary TDMS files.")
-vol_data = TDMSHandler.read_tdms_data(optical_encoder) # (nL)
-analog_in_data = TDMSHandler.read_tdms_data(analog_in) # (V)
-pressure_data = analog_in_data[0] # (kPa)
-force_data = analog_in_data[1] # (N)
-if not len(vol_data) == len(pressure_data) == len(force_data):
-    print("WARNING: Data lengths are not equal. Something has gone wrong.")
-t = np.arange(len(vol_data))/SAMPLE_RATE
-
-#### TEST OVERVIEW AND SAVIING ####
-## Print Brief Test Overview
-print("-----------------TEST OVERVIEW-----------------")
-print(f'The maximum pressure was {max(pressure_data)} kPa')
-print(f'The volume at maximum pressure was {vol_data[np.argmax(pressure_data)]} nL')
-print("-----------------------------------------------")
-
-## Write Data to a .csv File:
-data_name = ["t","volume","pressure","force"]
-data_unit = ["s","nL","kPa","N"]
-data = [t, vol_data, pressure_data, force_data]
-write_csv(FILEPATH_CSV, data_name, data_unit, data)
-print(f"NIC Update: Data successfully written to {FILEPATH_CSV}.")
+    raise Exception("Invalid test mode selected. Please select a valid test mode.")
