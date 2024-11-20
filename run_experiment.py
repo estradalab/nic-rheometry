@@ -11,12 +11,13 @@ Description: Script for running needle-induced cavitation experiments in a custo
 # LIVE_READ: Readout of sensor data is provided in real-time in the terminal. The pump is not actuated by the script. 
 # VCC_CONSTANT_RATE: The pump is actuated to infuse a constant volume at a constant rate. Sensor data is recorded and saved to a .csv file.
 # CALIBRATE_FRICTION: Run VCC_CONSTANT_RATE test with 5 repeated injections of 0.5 second durations with short pauses between to calibrate frictional forces for current FLOW_RATE.
-MODE = "LIVE_READ"
+MODE = "VCC_CONSTANT_RATE"
+APPLY_CORRECTIONS = True # If True, the csv will also include a corrected pressure reading without frictional additions.
 
 ## System Defintions: Define parameters that only change with alterations to the physical equiptment.
 DIAMETER_SYRINGE = 1.03     # Inner diameter of syringe (Hamilton Model 1705) in mm.
 CAPACITY_SYRINGE = 50       # Syringe (Hamilton Model 1705) volumetric capacity in microliters (µL).
-GAIN_PRESSURE_AMP = 368.04  # Should always be 368.04 unless DIP switches in the load cell Futek amplifier are changed from [0 0 0 0 0 0 1 1]
+GAIN_PRESSURE_AMP = 717.69  # Should always be 368.04 unless DIP switches in the load cell Futek amplifier are changed from [0 0 0 0 0 1 1 1]
 GAIN_FORCE_AMP = 1015.66    # Should always be 1015.66 unless DIP switches in the load cell Futek amplifier are changed from [0 0 0 0 1 1 1 0]
 VOLTAGE_RANGE_PRESSURE = [-10.0,10.0] # Voltage range (V) of pressure readings entering DAQ. Options limited to ±0.2 V, ±1 V, ±5 V, ±10 V.
 VOLTAGE_RANGE_FORCE = [-10.0,10.0]   
@@ -24,25 +25,30 @@ LOAD_RANGE_PRESSURE = [-68.9,413.6] # (kPa) ~ (-10 to 60 psi) Pressre extrema fo
 LOAD_RANGE_FORCE = [-222.4,222.4] # (N) ~ (±50 lb) Force extrema for Futek LCM300.
 
 ## Experiment Settings
-VOLUME_INJECTION = 100    # (nL) Amount of volume to be injected.
-FLOW_RATE = 100             # (nL/s) Constant flow rate.
+VOLUME_INJECTION = 1000    # (nL) Amount of volume to be injected.
+FLOW_RATE = 500            # (nL/s) Constant flow rate.
 
 # Data Aquisition Settings
 # Note: If analog input (i.e., force and pressure) readings are collected in excess of 1 kHz, ensure the 'Bandwidth' setting in the amplifier is set accordingly.
 SAMPLE_RATE = 2000           # (Hz) Sampling rate of all channels.                     
 WAIT_TIME_PREINJECTION = 1  # (s) Duration that force and pressure readings are collected prior to starting the injection.
 WAIT_TIME_POSTINJECTION = 1 # (s) Duration that force and pressure readings are collected after the injection is completed.
-TIMED_DAQ_END = True     # If True, data aquisition ends after WAIT_TIME_POSTINJECTION, otherwise type a character in terminal and hit ENTER to manually 
-                            # stop at any time after start of injection
+TIMED_DAQ_END = True    # If True, data aquisition ends after WAIT_TIME_POSTINJECTION, otherwise type a character in terminal and hit ENTER to manually 
+                        # stop at any time after start of injection
 from datetime import datetime
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")  # Format: YYYYMMDD_HHMMSS
-FOLDERPATH = 'C:\\Users\\jbecktt\\Desktop\\VCC_System\\VCC_test_'+timestamp+'\\' # This folder will be made if it does not already exist.
-FILEPATH_CSV = FOLDERPATH + 'VCC_'+timestamp+'.csv'
+TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")  # Format: YYYYMMDD_HHMMSS
+FOLDERPATH = 'C:\\Users\\jbecktt\\Desktop\\VCC_System\\VCC_test_'+TIMESTAMP+'\\' # This folder will be made if it does not already exist.
+FOLDERPATH_CAL = 'C:\\Users\\jbecktt\\Documents\\nic-run-code\\cal\\'
+FILEPATH_CSV = FOLDERPATH + 'VCC_raw_data_'+TIMESTAMP+'.csv'
+CAL_FILE = FOLDERPATH_CAL + 'friction_calibration_500_nLs-1_20241120_134618.csv'
 
 #### CLASS DEFINITIONS ####
-import serial, time, math, csv, nidaqmx, serial.tools.list_ports, os, sys, numpy as np, _thread
+import serial, time, math, csv, nidaqmx, serial.tools.list_ports, os, sys, numpy as np, _thread, matplotlib.pyplot as plt, pandas as pd
 from nidaqmx.constants import AcquisitionType, TerminalConfiguration, EncoderType, AngleUnits, Edge, Level, FrequencyUnits, LoggingOperation, LoggingMode, READ_ALL_AVAILABLE
 from nptdms import TdmsFile
+from itertools import chain
+from scipy.interpolate import interp1d
+from scipy.signal import savgol_filter
 
 class TDMSHandler:
     def __init__(self, folderpath,quiet=False):
@@ -78,17 +84,8 @@ class TDMSHandler:
                             data[i] = meas_obj._voltageV_to_pressurekPa(voltage) # (kPa)
                         elif meas_obj.data_type[i] == "force":
                             data[i] = meas_obj._voltageV_to_forceN(voltage) # (N)
-                        else: raise Exception("Data type not supported yet for .tdms file reading.")
+                        else: raise Exception("Data type not supported yet for .tdms file reading for analog inputs.")
                 return data
-
-            # if isinstance(meas_obj, PressureSensor):
-            #     voltage = tdms_file["pressure"][meas_obj.ai_chan].data # V
-            #     pressure = meas_obj._voltageV_to_pressurekPa(voltage) # kPa
-            #     return pressure if not raw else voltage
-            # elif isinstance(meas_obj, LoadCell):
-            #     voltage = tdms_file["force"][meas_obj.ai_chan].data # V
-            #     force = meas_obj._voltageV_to_forceN(voltage) # N
-            #     return force if not raw else voltage
             elif isinstance(meas_obj, OpticalEncoder):
                 cnt = tdms_file["angular_disp"][meas_obj.ci_chan].raw_data # count
                 position_incr = tdms_file["angular_disp"][meas_obj.ci_chan].properties["NI_Scale[1]_PositionEncoder_Position_Increment"] # angular_disp/count
@@ -156,6 +153,14 @@ class OpticalEncoder(NIDAQTask):
         self.ci_chan = ci_chan
         self.diameter_syringe = diameter_syringe
         self.filepath = filepath
+        if decoding_type == EncoderType.X_1:
+            ppr_scale = 1.0
+        elif decoding_type == EncoderType.X_2:
+            ppr_scale = 2.0
+        elif decoding_type == EncoderType.X_4:
+            ppr_scale = 4.0
+        else: raise Exception("Decoding type not recognized.")
+        self.resolution = self._angle_deg_to_vol_nL(360.0/(ppr_scale*pulses_per_rev))
 
     def _angle_deg_to_vol_nL(self,angle_deg):
         gear_ratio = 1/2.4
@@ -406,12 +411,17 @@ class SyringePump:
 
 #### TEST SET-UP ####
 if not MODE == "LIVE_READ": TDMSHandler(FOLDERPATH)
+if MODE == "CALIBRATE_FRICTION": SAMPLE_RATE = 5*FLOW_RATE
+
 global pump, analog_in, TEST_ACTIVE
 ## Initializing Syringe Pump and Sensors
 pump = SyringePump('COM4')
 pump.set_syringe_dims(DIAMETER_SYRINGE, CAPACITY_SYRINGE)
 duration_injection = VOLUME_INJECTION/FLOW_RATE
-time_DAQ_record = WAIT_TIME_PREINJECTION + duration_injection + WAIT_TIME_POSTINJECTION
+if MODE == "CALIBRATE_FRICTION":
+    time_DAQ_record = 60 # Place holder (very long for now)
+else:
+    time_DAQ_record = WAIT_TIME_PREINJECTION + duration_injection + WAIT_TIME_POSTINJECTION
 n_samples = math.ceil(time_DAQ_record*SAMPLE_RATE)
 pulse_gen = PulseGenerator('/Dev2/PFI12','/Dev2/ctr1',SAMPLE_RATE,n_samples) if not MODE == "LIVE_READ" else None
 encoder_type = EncoderType.X_4 # X_2 is generally has lower resolution than X_4, but is less sensitive to vibrations
@@ -419,11 +429,14 @@ optical_encoder = OpticalEncoder('Dev2/ctr0', encoder_type, DIAMETER_SYRINGE, FO
 analog_in = AnalogInput(['Dev2/ai0','Dev2/ai1'], ["pressure","force"], [GAIN_PRESSURE_AMP, GAIN_FORCE_AMP], [VOLTAGE_RANGE_PRESSURE,VOLTAGE_RANGE_FORCE], [LOAD_RANGE_PRESSURE,LOAD_RANGE_FORCE], FOLDERPATH+'analog_in.tdms', pulse_gen)
 
 # Start system protection thread to protect from overvoltage of DAQ or overload of sensor(s)
+def movmean(data, window_size):
+    return pd.Series(data).rolling(window=window_size, min_periods=1).mean().to_numpy()
 def overvoltage_protect_thread():
     global pump, analog_in, TEST_ACTIVE
     try:
         while TEST_ACTIVE:
-            ai_data = analog_in.read()
+            ai_data = analog_in.read_all()
+            ctr_data = optical_encoder.read_all()
             if MODE == "LIVE_READ" == True: 
                 time.sleep(0.001)
             safe_voltage = analog_in.safe_voltage_check(ai_data)
@@ -443,7 +456,304 @@ def write_csv(filename, data_name, data_unit, data):
         write.writerow(data_unit)
         write.writerows(zip(*padded_data))
     file.close()
+def read_csv(filename):
+    with open(filename, 'r') as file:
+        reader = csv.reader(file)
+        data_name = next(reader)
+        data_unit = next(reader)
+        data = [[] for _ in data_name]
+        for row in reader:
+            for i, value in enumerate(row):
+                data[i].append(float(value) if value else None)
+                
+    return data_name, data_unit, data
+def make_plot(filename, data_name, data_unit, data, volumeinjection = VOLUME_INJECTION, filt_window = None, title = None):
+    fig, axs = plt.subplots(3, 1, figsize=(10, 12))
+    axs[0].plot(data[data_name.index("time")], data[data_name.index("volume")])
+    axs[0].set_ylabel('Volume '+data_unit[data_name.index("volume")])
+    axs[0].set_xlabel('Time '+data_unit[data_name.index("time")])
+    axs[1].plot(data[data_name.index("time")], data[data_name.index("pressure")],label='Raw Data')
+    if filt_window is not None:
+        for i in range(len(filt_window)):
+            axs[1].plot(data[data_name.index("time")], savgol_filter(data[data_name.index("pressure")],round(SAMPLE_RATE*volumeinjection/FLOW_RATE*filt_window[i]),2),label=f'SG Window: {filt_window[i]} s')
+            if APPLY_CORRECTIONS == True:
+                axs[1].plot(data[data_name.index("time")], savgol_filter(data[data_name.index("pressure_corrected")],round(SAMPLE_RATE*volumeinjection/FLOW_RATE*filt_window[i]),2),label=f'Corrected Data. SG: {filt_window[i]} s')
+    axs[1].set_ylabel('Pressure '+data_unit[data_name.index("pressure")])
+    axs[1].legend()
+    axs[1].set_xlabel('Time '+data_unit[data_name.index("time")])
+    axs[2].plot(data[data_name.index("time")], data[data_name.index("force")])
+    axs[2].set_ylabel('Force '+data_unit[data_name.index("force")])
+    axs[2].set_xlabel('Time '+data_unit[data_name.index("time")])
+    if title is not None: plt.suptitle(title, fontsize=16, fontweight='bold')
+    plt.savefig(filename)
+    plt.show()
+def friction_calibration(data_name, data, N_CYCLES, T_INJECT, T_PAUSE_CYCLE):
+    cnt_pace = math.ceil(optical_encoder.resolution*SAMPLE_RATE/FLOW_RATE) # S/cnt
+    mm_fraction = 0.05
+    window_mm = round(mm_fraction*T_INJECT*SAMPLE_RATE) # Adjust window size based on total samples collected in injection time -- not completely right
+    # N_0 = round(0.25*T_INJECT*SAMPLE_RATE)
+    N_0_wait = round(0.05*T_PAUSE_CYCLE*SAMPLE_RATE)
+    N_0_bigwait = round(0.50*T_PAUSE_CYCLE*SAMPLE_RATE)
+    N_0_inject = round(0.25*T_INJECT*SAMPLE_RATE)
 
+    idx_time = data_name.index("time"); idx_vol = data_name.index("volume"); idx_pressure = data_name.index("pressure"); idx_force = data_name.index("force")
+    vdot_raw = np.diff(data[idx_vol])/np.diff(data[idx_time])
+    vdot = savgol_filter(vdot_raw,window_mm,2)
+    v2dot = savgol_filter(np.diff(vdot)/np.diff(data[idx_time][1:]),window_mm,2)
+    vdot_is0 = vdot == 0
+    vdot_raw_is0 = vdot_raw == 0
+    vdot_raw_lt0 = vdot_raw < 0
+    vdot_raw_gt0 = vdot_raw > 0
+    vdot_raw_le0 = vdot_raw <= 0
+
+    # Find start of each injection cycle
+    LIMITS_FOUND = False; itr = 0; N = N_0_wait
+    while LIMITS_FOUND == False:
+        idx_starts = [] # index of the start of each injection cycle
+        itr += 1
+        for i in range(N,len(vdot)-N):
+            if vdot_raw_gt0[i] == True and all(vdot_raw_is0[i-N:i]):
+                idx_starts.append(i)
+        if len(idx_starts) != N_CYCLES:
+            if itr == 30 or N == 1:
+                raise Exception("Friction calibration failed: Could not find bounds of the 5 injections.")
+            elif len(idx_starts) > N_CYCLES: 
+                N = round(1.1*N)
+            else: N = round(N*0.5)
+        else: 
+            LIMITS_FOUND = True
+            print(f"Found idx_starts in {itr} iterations. N/N_0_wait = {N/N_0_wait}")
+    def isNextNonzeroValueNegative(vec):
+        idx_first_nonzero = np.where(np.array(vec) != 0)[0][0]
+        if vec[idx_first_nonzero] < 0:
+            return True
+        else: return False
+
+    # Find end of each injection cycle
+    LIMITS_FOUND = False; itr = 0; N = N_0_wait
+    while LIMITS_FOUND == False:
+        idx_stops = [] # index of the start of each injection cycle
+        itr += 1
+        for i in range(N,len(vdot)-N+1):
+            if vdot_raw_gt0[i-1] == True and any(vdot_raw_lt0[i-N:i-1]) == False and (sum(vdot_raw_gt0[i-10*cnt_pace:i])>(10-1)) and (all(vdot_raw_le0[i:i+N]) or isNextNonzeroValueNegative(vdot_raw[i:i+N])): #and vdot_raw_is0[i-1-cnt_pace] == False:
+            # if vdot_raw_is0[i-1] == False and np.mean(vdot_raw_le0[i-cnt_pace:i]):
+                idx_stops.append(i)
+        if len(idx_stops) != N_CYCLES:
+            if itr == 30 or N == 1:
+                raise Exception("Friction calibration failed: Could not find bounds of the 5 injections.")
+            elif len(idx_stops) > N_CYCLES: 
+                N = math.ceil(1.1*N)
+            else: N = math.floor(0.5*N)
+        else: 
+            LIMITS_FOUND = True
+            print(f"Found idx_stops in {itr} iterations. N/N_0_wait = {N/N_0_wait}")
+    # Find start of each steady state region
+    LIMITS_FOUND = False; itr = 0; C = 1
+    while LIMITS_FOUND == False:
+        idx_ss_starts = [] # index of the start of each steady state region
+        itr += 1
+        speed_up = v2dot > np.std(v2dot)*C
+        for i in range(N_0_bigwait,len(vdot)-N_0_inject):
+            if speed_up[i-1] == True and all(speed_up[i:i+N_0_inject] == False) and all(vdot_is0[i:i+N_0_inject] == False):
+                idx_ss_starts.append(i)
+        if len(idx_ss_starts) != N_CYCLES:
+            if itr == 30:
+                raise Exception("Friction calibration failed: Could not find bounds of the 5 steady state regions.")
+            elif len(idx_ss_starts) > N_CYCLES:
+                C *= 1.1
+            elif len(idx_ss_starts) < N_CYCLES:
+                C *= 0.9
+        else: 
+            LIMITS_FOUND = True
+            print(f"Found idx_ss_starts in {itr} iterations.")
+    # Find end of each steady state region
+    LIMITS_FOUND = False; itr = 0; C = 1
+    while LIMITS_FOUND == False:
+        idx_ss_stops = [] # index of the end of each steady state region
+        itr += 1
+        slow_down = v2dot < -np.std(v2dot)*C
+        for i in range(N_0_inject,len(vdot)-N_0_bigwait):
+            if slow_down[i+1] == True and all(slow_down[i-N_0_inject+1:i+1] == False):
+                idx_ss_stops.append(i)
+        if len(idx_ss_stops) != N_CYCLES:
+            if itr == 20:
+                raise Exception("Friction calibration failed: Could not find bounds of the 5 steady state regions.")
+            else: C *= 1.1
+        else: 
+            LIMITS_FOUND = True
+            print(f"Found idx_ss_stops in {itr} iterations.")
+
+    # Segement data into 5 individual injections
+    data_segment = []
+    for start, stop in zip(idx_starts, idx_stops):
+        data_segment.append([data[i][start:stop] for i in range(len(data))])
+    pressure_baseline = np.mean(data[idx_pressure][0:idx_starts[0]])
+    pressure_baseline_std = np.std(data[idx_pressure][0:idx_starts[0]])
+    # force_baseline = np.mean(data[idx_force][0:idx_starts[0]])
+    # force_baseline_std = np.std(data[idx_force][0:idx_starts[0]])
+
+    idx_ss_starts_segment = []; idx_ss_stops_segment = []
+    for i in range(N_CYCLES):
+        data_segment[i][idx_time] -= data[idx_time][idx_starts[i]-1] # correct for time offset between segments
+        data_segment[i][idx_vol] -= data[idx_vol][idx_starts[i]-1] # correct for volume offset between segments
+        data_segment[i][idx_pressure] -= pressure_baseline # correct for pressure baseline
+        idx_ss_starts_segment.append(idx_ss_starts[i]-idx_starts[i]) # cropped to a conservative start-up region
+        idx_ss_stops_segment.append(idx_ss_stops[i]-idx_starts[i]) # cropped to a conservative start-up region
+
+    segment_lens = [len(data_segment[i][0]) for i in range(N_CYCLES)]
+    data_avg = [[] for _ in range(len(data))]
+    pressure_filt = [savgol_filter(data_segment[i][idx_pressure],window_mm,2) for i in range(N_CYCLES)]
+    # force_filt = [savgol_filter(data_segment[i][idx_force],window_mm,2) for i in range(N_CYCLES)]
+    for i in range(min(segment_lens)):
+        #fit_avg.append(np.mean([fit[k][i] for k in range(N_CYCLES)]))
+        for j in range(len(data)):
+            data_avg[j].append(np.mean([data_segment[k][j][i] for k in range(N_CYCLES)]))
+    pressure_avg_filt = savgol_filter(data_avg[idx_pressure],window_mm,2)
+    # force_avg_filt = savgol_filter(data_avg[idx_force],window_mm,2)
+
+    ss_start_est = max(idx_ss_starts_segment)
+    ss_stop_est = min(idx_ss_stops_segment)
+    ss_safe_len = ss_stop_est - ss_start_est + 1
+    ss_start_safe = ss_start_est + round(0.05*ss_safe_len)
+    ss_stop_safe = ss_stop_est - round(0.05*ss_safe_len)
+
+    pressure_drop_ss = np.mean(pressure_avg_filt[ss_start_safe:ss_stop_safe])
+
+    residual_ss = [np.array(pressure_filt[i][ss_start_safe:ss_stop_safe] - pressure_drop_ss) for i in range(len(pressure_filt))]
+    residual_trans = [np.array(pressure_filt[i][0:ss_start_safe]-pressure_avg_filt[0:ss_start_safe]) for i in range(len(pressure_filt))]
+    mean_residual_ss = float(np.mean(np.concatenate(residual_ss)))
+    mean_residual_trans = float(np.mean(np.concatenate(residual_trans)))
+    std_residual_ss = float(np.std(np.concatenate(residual_ss)))
+    std_residual_trans = float(np.std(np.concatenate(residual_trans)))
+
+    print(f"Mean ± SD pressure residual (ss//trans): {mean_residual_ss} ± {std_residual_ss} kPa // {mean_residual_trans} ± {std_residual_trans} kPa")
+    
+    # Make a plot of the data_segments but they're all on the same plot (not a subplot)
+    # Make all lines shades of blue
+    #plt.figure(figsize=(10,6))
+    fig, axs = plt.subplots(3, 2, figsize=(20, 20))
+    plt.suptitle(f'Frictional Pressure Drop Calibration. Flow Rate: {FLOW_RATE} nL/s', fontsize=16, fontweight='bold')
+    for i in range(len(data_segment)):
+        axs[0,0].plot(data_segment[i][idx_time],data_segment[i][idx_vol],label=f'Injection {i+1}',color=(0,0,1,(i+1)/(len(data_segment)+1)))
+        axs[1,0].plot(data_segment[i][idx_time],vdot[idx_starts[i]:idx_stops[i]],label=f'Injection {i+1}',color=(0,0,1,(i+1)/(len(data_segment)+1)))
+        axs[2,0].plot(data_segment[i][idx_time],data_segment[i][idx_pressure],label=f'Injection {i+1}',color=(0,0,1,(i+1)/(len(data_segment)+1)))
+        axs[0,1].plot(data_segment[i][idx_time],pressure_filt[i],label=f'Injection {i+1}',color=(0,0,1,(i+1)/(len(data_segment)+1)))
+        axs[2,1].plot(data_avg[idx_time][ss_start_safe:ss_stop_safe],residual_ss[i],color=(0,0,1,(i+1)/(len(data_segment)+1)))
+        axs[2,1].plot(data_avg[idx_time][0:ss_start_safe],residual_trans[i],color=(0.3,0.6,1,(i+1)/(len(data_segment)+1)))
+    axs[1,1].plot(data_avg[idx_time],pressure_avg_filt,label=f'Injection {i+1}',color=(0,0,1,(i+1)/(len(data_segment)+1)))
+    axs[1,1].axvline(data_avg[idx_time][max(idx_ss_starts_segment)],color=(0,0,1,0.5),linestyle='--')
+    axs[1,1].axvline(data_avg[idx_time][min(idx_ss_stops_segment)],linestyle='--',color=(0,0,1,0.5))
+    axs[1,1].axvline(data_avg[idx_time][ss_start_safe],linestyle='-',color=(0,0,1,0.5))
+    axs[1,1].axvline(data_avg[idx_time][ss_stop_safe],linestyle='-',color=(0,0,1,0.5))
+    axs[0,0].set_ylabel('Volume (nL)'); axs[0,0].set_xlabel('Time (s)')
+    axs[1,0].set_ylabel('Flow Rate (nL/s)'); axs[1,0].set_xlabel('Time (s)')
+    axs[2,0].set_ylabel('Pressure (kPa)'); axs[2,0].set_xlabel('Time (s)'); axs[2,0].legend()
+    axs[0,1].set_ylabel('Pressure (kPa) (SG filter)'); axs[0,1].set_xlabel('Time (s)')
+    axs[1,1].set_ylabel('Avg Pressure (kPa) (SG filter)'); axs[1,1].set_xlabel('Time (s)'); axs[1,1].legend()
+    axs[2,1].set_ylabel('Pressure Residual (kPa)'); axs[2,1].set_xlabel('Time (s)')
+   
+    plt.savefig(FOLDERPATH+f'CVE_Frictional_Calibration_{FLOW_RATE}_nLs-1.png')
+    plt.show()
+
+    if abs(np.mean(pressure_avg_filt)) < 0.001: # and np.std(savgol_filter(data_avg[idx_pressure],window_mm,2)) < 0.002:
+        PRESSURE_DROP_CORRECTION = [0] # Pressure drop correction is not necessary because noise exceeds pressure drop
+        t_ss_start = [0]
+        pressure_drop_ss = [0]
+        t_trans = []
+        pressure_trans = []
+        # force_trans = []
+    else: 
+        print("Automated calibration has completed. It believes there is meaningful pressure drop. Press 1 and Enter to save the calibration.")
+        PRESSURE_DROP_CORRECTION = [1]
+        t_ss_start = [data_avg[idx_time][ss_start_safe]] # beyond this time the steady state pressure drop can be used to correct the data
+        pressure_drop_ss = [pressure_drop_ss] # already defined above plotting
+        t_trans = data_avg[idx_time][0:ss_start_safe]
+        pressure_trans = pressure_avg_filt[0:ss_start_safe]
+        # force_trans = force_avg_filt[0:ss_start_safe]
+    if PRESSURE_DROP_CORRECTION == [0]:
+        msg = "The code believes that the noise in the pressure sensor exceeds the pressure drop. No correction will be applied."
+    else: msg = f"The code believes that a pressure drop correction is necessary at {FLOW_RATE} nL/s."
+    user_input = input("Automated calibration has completed. "+msg+" Press 1 and hit Enter to save the calibration: ")
+    if user_input == "1":
+        data_name_cal = ["PRESSURE_DROP_CORRECTION","t_ss_start","pressure_drop_ss","t_trans","pressure_trans","mean_residual_ss","mean_residual_trans","std_residual_ss","std_residual_trans"]
+        data_unit_cal = ["bool","s","kPa","s","kPa","kPa","kPa","kPa","kPa"]
+        data_cal = [PRESSURE_DROP_CORRECTION, t_ss_start, pressure_drop_ss, t_trans, pressure_trans, [mean_residual_ss], [mean_residual_trans], [std_residual_ss], [std_residual_trans]]
+        write_csv(FOLDERPATH+f'friction_calibration_{FLOW_RATE}.csv', data_name_cal, data_unit_cal, data_cal)
+        write_csv(FOLDERPATH_CAL+f'friction_calibration_{FLOW_RATE}_nLs-1_{TIMESTAMP}.csv', data_name_cal, data_unit_cal, data_cal)
+        print("Friction calibration data written to csv file.")
+    else: print("Calibration aborted. No calibration file saved.")
+    return PRESSURE_DROP_CORRECTION
+def friction_correction(t,volume,pressure,cal_file):
+    pressure_correct = pressure.copy()
+    cal_name, cal_unit, cal_data = read_csv(cal_file)
+    t_ss_start = cal_data[cal_name.index("t_ss_start")][0] # This is time *after* start of injection
+    idx_inject_start = find_injection_start(volume)
+    idx_inject_end = find_injection_end(volume)
+    t_inject_start = t[idx_inject_start]
+    t_inject_end = t[idx_inject_end]
+    idx_ss_start = np.where(t >= t_ss_start + t_inject_start)[0][0]
+    idx_ss_end = np.where(t >= t_inject_end)[0][0]
+    trans_interp = interp1d(cal_data[cal_name.index("t_trans")],cal_data[cal_name.index("pressure_trans")],fill_value="extrapolate")
+    pressure_init = np.mean(pressure[:idx_inject_start])
+
+    pressure_correct -= pressure_init
+    pressure_correct[idx_inject_start:idx_ss_start] -= trans_interp(t[idx_inject_start:idx_ss_start]-t[idx_inject_start])
+    pressure_correct[idx_ss_start:idx_ss_end] -= cal_data[cal_name.index("pressure_drop_ss")][0]
+    return pressure_correct
+def find_injection_start(volume, N_CYCLES=1):
+    N_0_wait = round(0.05*WAIT_TIME_PREINJECTION*SAMPLE_RATE)
+    vdot = np.diff(volume)
+    vdot_is0 = vdot == 0
+    vdot_gt0 = vdot > 0
+    LIMITS_FOUND = False; itr = 0; N = N_0_wait
+    while LIMITS_FOUND == False:
+        idx_starts = [] # index of the start of each injection cycle
+        itr += 1
+        for i in range(N,len(vdot)-N):
+            if vdot_gt0[i] == True and all(vdot_is0[i-N:i]):
+                idx_starts.append(i)
+        if len(idx_starts) != N_CYCLES:
+            if itr == 30 or N == 1:
+                raise Exception("Friction calibration failed: Could not find bounds of the 5 injections.")
+            elif len(idx_starts) > N_CYCLES: 
+                N = round(1.1*N)
+            else: N = round(N*0.5)
+        else: 
+            LIMITS_FOUND = True
+            print(f"Found idx_starts in {itr} iterations. N/N_0_wait = {N/N_0_wait}")
+            return idx_starts[0] if N_CYCLES == 1 else idx_starts
+def find_injection_end(volume, N_CYCLES=1):
+    cnt_pace = math.ceil(optical_encoder.resolution*SAMPLE_RATE/FLOW_RATE) # S/cnt
+    def isNextNonzeroValueNegative(vec):
+        idx_first_nonzero = np.where(np.array(vec) != 0)[0][0]
+        if vec[idx_first_nonzero] < 0:
+            return True
+        else: return False
+    vdot = np.diff(volume)
+    vdot_lt0 = vdot < 0
+    vdot_le0 = vdot <= 0
+    vdot_gt0 = vdot > 0
+    N_0_wait = round(0.05*WAIT_TIME_PREINJECTION*SAMPLE_RATE)
+    # Find end of each injection cycle
+    LIMITS_FOUND = False; itr = 0; N = N_0_wait
+    while LIMITS_FOUND == False:
+        idx_stops = [] # index of the start of each injection cycle
+        itr += 1
+        for i in range(N,len(vdot)-N+1):
+            if vdot_gt0[i-1] == True and any(vdot_lt0[i-N:i-1]) == False and (sum(vdot_gt0[i-10*cnt_pace:i])>(10-1)) and (all(vdot_le0[i:i+N]) or isNextNonzeroValueNegative(vdot[i:i+N])): #and vdot_raw_is0[i-1-cnt_pace] == False:
+            # if vdot_raw_is0[i-1] == False and np.mean(vdot_raw_le0[i-cnt_pace:i]):
+                idx_stops.append(i)
+        if len(idx_stops) != N_CYCLES:
+            if itr == 30 or N == 1:
+                raise Exception("Friction calibration failed: Could not find bounds of the 5 injections.")
+            elif len(idx_stops) > N_CYCLES: 
+                N = math.ceil(1.1*N)
+            else: N = math.floor(0.5*N)
+        else: 
+            LIMITS_FOUND = True
+            print(f"Found idx_stops in {itr} iterations. N/N_0_wait = {N/N_0_wait}")
+            return idx_stops[0] if N_CYCLES == 1 else idx_stops
+            
 class NICTestMethod:
     def __init__(self,test):
         self.test = test
@@ -502,13 +812,24 @@ class NICTestMethod:
                 if manual_stop_str:
                     TEST_ACTIVE = False
         elif calibrate_friction:
-            n = 0
-            time.sleep(0.25)
-            while n < 5: # run 5 cycles
+            N_CYCLE = 10
+            T_INJECT = optical_encoder.resolution/FLOW_RATE*1e3*0.75 # Time for 1000 optical encoder pulses to occur
+            VOLUME_INJECTION_CAL = FLOW_RATE*T_INJECT
+            T_PAUSE_INIT = max([1 + 0.1*T_INJECT,2]) # Modified by T_INJECT to ensure no issues occur even if sampling rate is low for low rate tests
+            T_PAUSE_CYCLE = T_PAUSE_INIT
+            print(f"NIC Update: Calibration will take approx. {T_PAUSE_INIT+N_CYCLE*(T_PAUSE_CYCLE+T_INJECT)} s to complete.")
+            t_startcal = time.perf_counter()
+            n = 0 
+            time.sleep(T_PAUSE_INIT)
+            while n < N_CYCLE: # run 5 cycles
                 n += 1
-                if TEST_ACTIVE: pump.infuse_const_rate(FLOW_RATE*0.5, FLOW_RATE)
-                time.sleep(0.6) # wait a full second (half second of this time will be used for injection)
+                t_startpump = time.perf_counter()
+                if TEST_ACTIVE: pump.infuse_const_rate(VOLUME_INJECTION_CAL, FLOW_RATE)
+                t_endpump = time.perf_counter()
+                time.sleep(T_INJECT-(t_endpump-t_startpump)+T_PAUSE_CYCLE) # effectively injecting and waiting T_PAUSE_CYCLE seconds before ending cycle
             TEST_ACTIVE = False
+            t_endcal = time.perf_counter()
+            print(f"NIC Update: Total time of test: {t_endcal-t_startcal} s.")
         pulse_gen.stop()
         print("NIC Update: Injection and data aquisition completed. Starting to clean-up DAQ tasks.")
         optical_encoder.read_all(); analog_in.read_all() # Only necessary if using TDMS file reading with LoggingMode.LOG_AND_READ
@@ -529,11 +850,22 @@ class NICTestMethod:
         print(f'The volume at maximum pressure was {vol_data[np.argmax(pressure_data)]} nL')
         print("-----------------------------------------------")
         ## Write Data to a .csv File:
-        data_name = ["t","volume","pressure","force"]
+        data_name = ["time","volume","pressure","force"]
         data_unit = ["s","nL","kPa","N"]
         data = [t, vol_data, pressure_data, force_data]
+        if APPLY_CORRECTIONS and MODE != "CALIBRATE_FRICTION":
+            pressure_data_corrected = friction_correction(t,vol_data,pressure_data,CAL_FILE)
+            data_name.append("pressure_corrected")
+            data_unit.append("kPa")
+            data.append(pressure_data_corrected)
+        if calibrate_friction: 
+            friction_calibration(data_name,data,N_CYCLE,T_INJECT,T_PAUSE_CYCLE)
         write_csv(FILEPATH_CSV, data_name, data_unit, data)
         print(f"NIC Update: Data successfully written to {FILEPATH_CSV}.")
+        FILEPATH_PNG = FILEPATH_CSV.replace(".csv", ".png")
+        if not calibrate_friction: 
+            make_plot(FILEPATH_PNG, data_name, data_unit, data, filt_window = [0.01, 0.025, 0.05], title= f"FLOW_RATE: {FLOW_RATE} nL/s. SAMPLE_RATE: {SAMPLE_RATE} Hz.")
+            print(f"NIC Update: PLOT successfully written to {FILEPATH_PNG}.")
 
 #### RUN VCC TEST ####
 ## Start Data Acquisition and Injection
