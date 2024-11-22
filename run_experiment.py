@@ -49,6 +49,7 @@ from nptdms import TdmsFile
 from itertools import chain
 from scipy.interpolate import interp1d
 from scipy.signal import savgol_filter
+from collections import deque
 
 class TDMSHandler:
     def __init__(self, folderpath,quiet=False):
@@ -119,7 +120,7 @@ class NIDAQTask:
                                                                                 # If sample mode is FINITE, the code waits until the task is finished and then reads the buffer.
 
 class OpticalEncoder(NIDAQTask):
-    def __init__(self, ci_chan, decoding_type, diameter_syringe, filepath, pulse_gen=None, sample_rate=None, n_samples=None, sample_mode=AcquisitionType.CONTINUOUS):
+    def __init__(self, ci_chan, decoding_type, diameter_syringe, filepath, pulse_gen=None, sample_rate=None, n_samples=None, sample_mode=AcquisitionType.CONTINUOUS, savedata = True):
         super().__init__()
         units = AngleUnits.DEGREES
         pulses_per_rev = 100 # E4T encoder spec
@@ -144,7 +145,7 @@ class OpticalEncoder(NIDAQTask):
             else:
                 self.task.timing.cfg_samp_clk_timing(sample_rate=sample_rate,
                                         sample_mode=sample_mode)
-        if isinstance(pulse_gen,PulseGenerator) or sample_rate is not None:
+        if (isinstance(pulse_gen,PulseGenerator) or sample_rate is not None) and savedata == True:
             TDMSHandler.chkfile(filepath)
             self.task.in_stream.configure_logging(filepath,
                                                   LoggingMode.LOG_AND_READ,    
@@ -160,7 +161,7 @@ class OpticalEncoder(NIDAQTask):
         elif decoding_type == EncoderType.X_4:
             ppr_scale = 4.0
         else: raise Exception("Decoding type not recognized.")
-        self.resolution = self._angle_deg_to_vol_nL(360.0/(ppr_scale*pulses_per_rev))
+        self.resolution = self._angle_deg_to_vol_nL(360.0/(ppr_scale*pulses_per_rev)) # nL/count
 
     def _angle_deg_to_vol_nL(self,angle_deg):
         gear_ratio = 1/2.4
@@ -169,14 +170,12 @@ class OpticalEncoder(NIDAQTask):
         vol = angle_deg*factor*A_syringe # mm^3 or μL
         return vol*10**3 # nL
 
-    def read_volume(self):
-        return self._angle_deg_to_vol_nL(self.read())
-    
-    def print_volume(self):
-        print("%.3f nL" % self.read_volume())
+    def read_volume(self,raw = False,all = False):
+        cnt = self.read_all() if all else self.read()
+        return self._angle_deg_to_vol_nL(np.array(cnt)).tolist() if not raw else cnt
 
 class AnalogInput(NIDAQTask):
-    def __init__(self, ai_chan, data_type, gain, ai_range_V, ai_range_conv, filepath, pulse_gen=None, sample_rate=None, n_samples=None, sample_mode=AcquisitionType.CONTINUOUS):
+    def __init__(self, ai_chan, data_type, gain, ai_range_V, ai_range_conv, filepath, pulse_gen=None, sample_rate=None, n_samples=None, sample_mode=AcquisitionType.CONTINUOUS, savedata=True):
         super().__init__() # Ensures that NIDAQTask Class is also initialized
         for i in range(len(ai_chan)):
             self.task.ai_channels.add_ai_voltage_chan(physical_channel=ai_chan[i], 
@@ -195,7 +194,7 @@ class AnalogInput(NIDAQTask):
             else:
                 self.task.timing.cfg_samp_clk_timing(sample_rate=sample_rate,
                                         sample_mode=sample_mode)
-        if isinstance(pulse_gen,PulseGenerator) or sample_rate is not None:
+        if (isinstance(pulse_gen,PulseGenerator) or sample_rate is not None) and savedata == True:
             TDMSHandler.chkfile(filepath)
             self.task.in_stream.configure_logging(filepath,
                                                   LoggingMode.LOG_AND_READ,
@@ -217,12 +216,9 @@ class AnalogInput(NIDAQTask):
         pressure = voltage*10**3/(self.gain[self.data_type.index("pressure")]*mV_kPa) # kPa
         return pressure
     
-    def read_pressure(self,raw = False):
-        voltage = self.read()
-        return self._voltageV_to_pressurekPa(voltage[self.data_type.index("pressure")]) if not raw else voltage[self.data_type.index("pressure")] # only print the most recent value
-
-    def print_pressure(self):
-        print("%.3f kPa" % self.read_pressure())
+    def read_pressure(self,raw=False,all=False):
+        voltage = self.read_all() if all else self.read()
+        return self._voltageV_to_pressurekPa(np.array(voltage[self.data_type.index("pressure")])).tolist() if not raw else voltage[self.data_type.index("pressure")]
 
     def _voltageV_to_forceN(self,voltage):
         N_lb = 4.44822 # N/lb conversion
@@ -233,15 +229,12 @@ class AnalogInput(NIDAQTask):
         force = sensitivity*voltage*N_lb # N
         return force
     
-    def read_force(self, raw = False):
-        voltage = self.read()
-        return self._voltageV_to_forceN(voltage[self.data_type.index("force")]) if not raw else voltage[self.data_type.index("force")] # only print the most recent value
+    def read_force(self,raw=False,all=False):
+        voltage = self.read_all() if all else self.read()
+        return self._voltageV_to_forceN(np.array(voltage[self.data_type.index("force")])).tolist() if not raw else voltage[self.data_type.index("force")]
 
-    def print_force(self):
-        print("%.3f N" % self.read_force())
-    
     def _get_overvoltage_limits(self):
-        self.overvoltage_range = {}; self.overload = {}
+        self.overvoltage_range = {}; self.overload = {}; self.overvoltage_range_conv = {}
         for i in range(len(self.ai_chan)):
             if self.data_type[i] == "force":
                 Vlim_low = [self.ai_range_V[i][0],self.ai_range_conv[i][0]/self._voltageV_to_forceN(1)]
@@ -252,6 +245,10 @@ class AnalogInput(NIDAQTask):
             else: raise Exception("Data type not supported yet for overvoltage protection.")
             self.overvoltage_range[i] = [max(Vlim_low), min(Vlim_high)]
             self.overload[i] = [Vlim_low.index(self.overvoltage_range[i][0]), Vlim_high.index(self.overvoltage_range[i][1])]
+            if self.data_type[i] == "force":
+                self.overvoltage_range_conv[i] = self._voltageV_to_forceN(np.array(self.overvoltage_range[i])).tolist()
+            elif self.data_type[i] == "pressure":
+                self.overvoltage_range_conv[i] = self._voltageV_to_pressurekPa(np.array(self.overvoltage_range[i])).tolist()
 
     def safe_voltage_check(self,data):
         data = np.array(data)
@@ -397,6 +394,8 @@ class SyringePump:
             time.sleep(0.01)
             if time.perf_counter() - start_time_diameter > 5: # 5 second timeout
                 raise Exception('Unable to set syringe diameter. Timed out')
+        self.flow_rate_min = 0.069/27.5*(math.pi*(diameter/2)**2) # nL/s 
+        self.flow_rate_max = 0.069/(26*10**-6)*(math.pi*(diameter/2)**2) # nL/s
 
         start_time_volume = time.perf_counter()
         self.query('svolume ' + '0' + ' ul') # Setting units to ul
@@ -410,42 +409,63 @@ class SyringePump:
         if self.serial_port.is_open: self.serial_port.close()
 
 #### TEST SET-UP ####
-if not MODE == "LIVE_READ": TDMSHandler(FOLDERPATH)
-if MODE == "CALIBRATE_FRICTION": SAMPLE_RATE = 5*FLOW_RATE
+if MODE == "LIVE_READ":
+    SAVE_DATA = False
+else: 
+    TDMSHandler(FOLDERPATH)
+    SAVE_DATA = True
+    if MODE == "CALIBRATE_FRICTION": SAMPLE_RATE = 5*FLOW_RATE
 
 global pump, analog_in, TEST_ACTIVE
 ## Initializing Syringe Pump and Sensors
 pump = SyringePump('COM4')
 pump.set_syringe_dims(DIAMETER_SYRINGE, CAPACITY_SYRINGE)
 duration_injection = VOLUME_INJECTION/FLOW_RATE
-if MODE == "CALIBRATE_FRICTION":
+if MODE == "CALIBRATE_FRICTION" or MODE == "LIVE_READ":
     time_DAQ_record = 60 # Place holder (very long for now)
 else:
     time_DAQ_record = WAIT_TIME_PREINJECTION + duration_injection + WAIT_TIME_POSTINJECTION
 n_samples = math.ceil(time_DAQ_record*SAMPLE_RATE)
-pulse_gen = PulseGenerator('/Dev2/PFI12','/Dev2/ctr1',SAMPLE_RATE,n_samples) if not MODE == "LIVE_READ" else None
+pulse_gen = PulseGenerator('/Dev2/PFI12','/Dev2/ctr1',SAMPLE_RATE,n_samples)
 encoder_type = EncoderType.X_4 # X_2 is generally has lower resolution than X_4, but is less sensitive to vibrations
-optical_encoder = OpticalEncoder('Dev2/ctr0', encoder_type, DIAMETER_SYRINGE, FOLDERPATH+'angular_disp.tdms', pulse_gen)
-analog_in = AnalogInput(['Dev2/ai0','Dev2/ai1'], ["pressure","force"], [GAIN_PRESSURE_AMP, GAIN_FORCE_AMP], [VOLTAGE_RANGE_PRESSURE,VOLTAGE_RANGE_FORCE], [LOAD_RANGE_PRESSURE,LOAD_RANGE_FORCE], FOLDERPATH+'analog_in.tdms', pulse_gen)
+optical_encoder = OpticalEncoder('Dev2/ctr0', encoder_type, DIAMETER_SYRINGE, FOLDERPATH+'angular_disp.tdms', pulse_gen, savedata = SAVE_DATA)
+analog_in = AnalogInput(['Dev2/ai0','Dev2/ai1'], ["pressure","force"], [GAIN_PRESSURE_AMP,GAIN_FORCE_AMP], 
+                        [VOLTAGE_RANGE_PRESSURE,VOLTAGE_RANGE_FORCE], [LOAD_RANGE_PRESSURE,LOAD_RANGE_FORCE], 
+                        FOLDERPATH+'analog_in.tdms', pulse_gen, savedata = SAVE_DATA)
 
 # Start system protection thread to protect from overvoltage of DAQ or overload of sensor(s)
 def movmean(data, window_size):
     return pd.Series(data).rolling(window=window_size, min_periods=1).mean().to_numpy()
-def overvoltage_protect_thread():
+def overvoltage_protect_thread(live_read = False, refresh_rate = 10):
     global pump, analog_in, TEST_ACTIVE
+    if live_read:
+        maxlen = int(np.ceil(SAMPLE_RATE/refresh_rate))
+        data_queue_pressure = deque(maxlen=maxlen)
+        data_queue_force = deque(maxlen=maxlen)
     try:
         while TEST_ACTIVE:
             ai_data = analog_in.read_all()
-            ctr_data = optical_encoder.read_all()
-            if MODE == "LIVE_READ" == True: 
-                time.sleep(0.001)
+            ctr_data = optical_encoder.read_volume(raw=False,all=True)
             safe_voltage = analog_in.safe_voltage_check(ai_data)
             if not safe_voltage:
-                TEST_ACTIVE = False
                 pump.stop()
-                print("NIC Update: Pump stopped due to protect system from overvoltage/overload.")
-    except nidaqmx.DaqError as e:
-        if TEST_ACTIVE: print("Overvoltage protection thread stopped due to error: ", e)
+                TEST_ACTIVE = False
+                raise Exception("Overvoltage protection triggered: analog voltage reading(s) exceeded safe range.")
+            if MODE == "LIVE_READ" and TEST_ACTIVE:
+                time.sleep(1/refresh_rate)
+                data_queue_pressure.extend(ai_data[analog_in.data_type.index("pressure")])
+                data_queue_force.extend(ai_data[analog_in.data_type.index("force")])
+                vol_str = "Volume: %.3f nL  " % ctr_data[-1] #optical_encoder.read_volume()
+                pressure_V = np.mean(data_queue_pressure)
+                pressure_str = "Pressure: %.4f kPa (%.5f V)  " % (analog_in._voltageV_to_pressurekPa(pressure_V), pressure_V)
+                force_V = np.mean(data_queue_force)
+                force_str = "Force: %.4f N (%.5f V)  " % (analog_in._voltageV_to_forceN(force_V), force_V)
+                print(f"{vol_str}\t{pressure_str}\t{force_str}", end="\r")
+    except KeyboardInterrupt:
+        raise Exception("Live reading mode stopped by user.")
+    except Exception as e:
+        raise e
+        
 def write_csv(filename, data_name, data_unit, data):
     max_length = max(len(lst) for lst in data)
     padded_data = [lst + [None] * (max_length - len(lst)) if max_length - len(lst) > 0 else lst for lst in data]
@@ -764,28 +784,17 @@ class NICTestMethod:
         elif test == "CALIBRATE_FRICTION":
             self.vcc_constant_rate(calibrate_friction=True)
         
-    def print_live_sensor_readout(self,t_wait=0.1):
+    def print_live_sensor_readout(self,refresh_rate=10):
         global TEST_ACTIVE
-        _thread.start_new_thread(overvoltage_protect_thread,())
+        optical_encoder.start(); analog_in.start(); pulse_gen.start()
         try: 
-            while True:
-                vol_str = "Volume: %.3f nL  " % optical_encoder.read_volume()
-                pressure_V = analog_in.read_pressure(raw=True)
-                pressure_str = "Pressure: %.3f kPa (%.5f V)  " % (analog_in._voltageV_to_pressurekPa(pressure_V), pressure_V)
-                force_V = analog_in.read_force(raw=True)
-                force_str = "Force: %.3f N (%.5f V)  " % (analog_in._voltageV_to_forceN(force_V), force_V)
-                print(f"{vol_str}\t{pressure_str}\t{force_str}", end="\r")
-                time.sleep(t_wait) 
-        except nidaqmx.DaqError as e:
-            TEST_ACTIVE = False
-            print('An error occurred during live reading mode: ', e)
-        except KeyboardInterrupt:
-            TEST_ACTIVE = False
-            print("\nLive reading mode stopped by user")
+            _thread.start_new_thread(overvoltage_protect_thread(live_read=True,refresh_rate=refresh_rate),())
+        except Exception as e:
+            if TEST_ACTIVE: TEST_ACTIVE = False
+            print(f"\n{e}")
         finally: 
-            optical_encoder.close(); analog_in.close()
-            time.sleep(3)
-        sys.exit() # Exit script after live reading mode is stopped
+            pulse_gen.close(); optical_encoder.close(); analog_in.close()
+
     def vcc_constant_rate(self,calibrate_friction=False):
         global TEST_ACTIVE
         ## Prepare DAQ for test
