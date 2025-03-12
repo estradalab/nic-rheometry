@@ -11,7 +11,7 @@ Description: Script for running needle-induced cavitation experiments in a custo
 # LIVE_READ: Readout of sensor data is provided in real-time in the terminal. The pump is not actuated by the script. 
 # VCC_CONSTANT_RATE: The pump is actuated to infuse a constant volume at a constant rate. Sensor data is recorded and saved to a .csv file.
 # CALIBRATE_FRICTION: Run VCC_CONSTANT_RATE test with 5 repeated injections of 0.5 second durations with short pauses between to calibrate frictional forces for current FLOW_RATE.
-MODE = "VCC_CONSTANT_RATE"
+MODE = "LIVE_READ"
 REPROCESS = False
 APPLY_CORRECTIONS = False # If True, the csv will also include a corrected pressure reading without frictional additions.
 RECORD_FORCE = False # If False, no force readings are taken
@@ -468,43 +468,53 @@ analog_in = AnalogInput(['Dev2/ai0','Dev2/ai1'], ["pressure","force"], [GAIN_PRE
 # Start system protection thread to protect from overvoltage of DAQ or overload of sensor(s)
 def movmean(data, window_size):
     return pd.Series(data).rolling(window=window_size, min_periods=1).mean().to_numpy()
-def overvoltage_protect_thread(live_read = False, refresh_rate = 10, record_force = RECORD_FORCE):
+def overvoltage_protect_thread(live_read = False, refresh_rate = 10, record_force = RECORD_FORCE, timeout_daq = 5):
+    if MODE == "LIVE_READ": t_refresh = time.time()
+    if timeout_daq <= 1/SAMPLE_RATE: raise ValueError("Timeout for data acquisition must be greater than the refresh rate.")
     global analog_in, TEST_ACTIVE
     if not live_read: global stepper
     if live_read:
         maxlen = int(np.ceil(SAMPLE_RATE/refresh_rate))
         data_queue_pressure = deque(maxlen=maxlen)
         if record_force: data_queue_force = deque(maxlen=maxlen)
+
     try:
         while TEST_ACTIVE:
             ai_data = analog_in.read_all()
-            ctr_data = optical_encoder.read_volume(raw=False,all=True) # JGB: temporarily changed to raw=True
             if len(ai_data)> 0:
+                t_newdata = time.time()
+                # Overvoltage protection
                 safe_voltage = analog_in.safe_voltage_check(ai_data)
                 if not safe_voltage:
-                    stepper.stop_motor()
+                    if not live_read: stepper.stop_motor()
                     TEST_ACTIVE = False
                     raise Exception("Overvoltage protection triggered: analog voltage reading(s) exceeded safe range.")
-            if MODE == "LIVE_READ" and TEST_ACTIVE:
-                time.sleep(1/refresh_rate)
-                vol_str = "Volume: %.3f nL  " % ctr_data[-1]
-                if record_force:
-                    data_queue_pressure.extend(ai_data[analog_in.data_type.index("pressure")])
-                    data_queue_force.extend(ai_data[analog_in.data_type.index("force")])
-                    force_V = np.mean(data_queue_force)
-                    force_str = "Force: %.4f N (%.5f V)  " % (analog_in._voltageV_to_forceN(force_V), force_V)
-                else: 
-                    data_queue_pressure.extend(ai_data)
-                pressure_V = np.mean(data_queue_pressure)
-                pressure_str = "Pressure: %.4f kPa (%.5f V)  " % (analog_in._voltageV_to_pressurekPa(pressure_V), pressure_V)
-                if record_force: 
-                    print(f"{vol_str}\t{pressure_str}\t{force_str}", end="\r")
-                else: 
-                    print(f"{vol_str}\t{pressure_str}", end="\r")
+                # Live read printing
+                if MODE == "LIVE_READ" and TEST_ACTIVE:
+                    if record_force:
+                        data_queue_pressure.extend(ai_data[analog_in.data_type.index("pressure")])
+                        data_queue_force.extend(ai_data[analog_in.data_type.index("force")])
+                    else: 
+                        data_queue_pressure.extend(ai_data)
+                    if (time.time() - t_refresh) >= 1/refresh_rate:
+                        t_refresh = time.time()
+                        ctr_data = optical_encoder.read_volume(raw=False,all=True)
+                        vol_str = "Volume: %.3f nL  " % ctr_data[-1]
+                        pressure_V = np.mean(data_queue_pressure)
+                        pressure_str = "Pressure: %.4f kPa (%.5f V)  " % (analog_in._voltageV_to_pressurekPa(pressure_V), pressure_V)
+                        if record_force:
+                            force_V = np.mean(data_queue_force)
+                            force_str = "Force: %.4f N (%.5f V)  " % (analog_in._voltageV_to_forceN(force_V), force_V)
+                            print(f"{vol_str}\t{pressure_str}\t{force_str}", end="\r")
+                        else:
+                            print(f"{vol_str}\t{pressure_str}", end="\r")  
+            elif (time.time() - t_newdata) > timeout_daq:
+                TEST_ACTIVE = False
+                raise Exception("Test due to unexpected loss of data aquisition in overvoltage protection thread.")
     except KeyboardInterrupt:
         raise Exception("Live reading mode stopped by user.")
-    #except Exception as e: 
-    #    print(f"An error occurred during the overvoltage protection thread: {e}")
+    except Exception as e: 
+        print(f"An error occurred during the overvoltage protection thread: {e}")
 def write_csv(filename, data_name, data_unit, data):
     max_length = max(len(lst) for lst in data)
     padded_data = [lst + [None] * (max_length - len(lst)) if max_length - len(lst) > 0 else lst for lst in data]
